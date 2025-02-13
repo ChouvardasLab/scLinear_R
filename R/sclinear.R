@@ -226,6 +226,11 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
     ))
   }
 
+  # If not zscore normalized, training set is not a matrix at this point --> take transformation out of the zscore block
+  # For not explicit conversion here
+  training_set <- as.matrix(training_set)
+
+
   # If lm-test-data was used for tsvd training step, reduce lm input back to only train data
   training_set <- training_set[intersect(colnames(gexp_train),rownames(training_set)),]
 
@@ -233,7 +238,6 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
   # transposed to match expected input format for lm
   # here the indexing works rather quickly --> no conversion to array necessary
   adt_train_modelling <- Matrix::t(adt_train)[intersect(rownames(training_set),colnames(adt_train)),]
-
 
   rm(gexp_train,gexp_test)
   print('Fitting linear models')
@@ -287,6 +291,7 @@ predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE){
     }
     ))
   }
+  gexp <- as.matrix(gexp)
 
   gexp_projected <- gexp %*% predictor$tsvd_v
 
@@ -339,7 +344,7 @@ evaluate_predictor <- function(predictor,gexp_test,adt_test,gexp_layer = 'counts
   }else{
       # Converting from Matrix::Matrix to base Matrix (and transposing)
       adt_test <- as.matrix(Matrix::t(adt_test))
-      }
+  }
 
   p_adt <- subset(predicted_adt,features = which(colnames(predicted_adt) %in% colnames(adt_test)) )
   t_adt <- subset(adt_test,features = which(colnames(adt_test) %in% colnames(predicted_adt)) )
@@ -453,7 +458,6 @@ feature_importance <- function(predictor,gexp,layer_gexp,normalize_gex = TRUE,n_
 
 
   # environment(cellwise_jacobian) <- environment(feature_importance)
-  on.exit(parallel::stopCluster(cl))
   # Slow but that's a looooot of matrix multiplications to run so probably to be expected
 
   N <- ncol(gexp_projected)
@@ -476,7 +480,6 @@ feature_importance <- function(predictor,gexp,layer_gexp,normalize_gex = TRUE,n_
   # v_t <- Matrix::t(predictor$tsvd_v)
   v <- Matrix::t(predictor$tsvd_v)
 
-  browser()
   print('Calculating Matrix product WJV')
   f <- function(WJ_element){cross_cell_average_fi_c(WJ_element,v)}
   env <- new.env(parent = environment(feature_importance))
@@ -484,7 +487,7 @@ feature_importance <- function(predictor,gexp,layer_gexp,normalize_gex = TRUE,n_
   environment(f) <- env
   cl <- parallel::makeCluster(n_cores,outfile = 'feature_importance_log.txt')
   # Likely change to 'library(scLineaR)' when deploying as a package if path is not relative to package directory
-  parallel::clusterEvalQ('src/matrix_product.cpp')
+  parallel::clusterEvalQ(cl,Rcpp::sourceCpp('src/matrix_product.cpp'))
   parallel::clusterExport(cl,list('v'),envir = env)
   parallel::clusterExport(cl,list('cross_cell_average_fi_c'))
   WJV <- pbapply::pbapply(cl=cl, X= WJ, MARGIN = 1, FUN= f)
