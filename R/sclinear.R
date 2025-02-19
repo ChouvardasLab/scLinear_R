@@ -105,7 +105,7 @@ filter_input_genes <- function(gexp,predictor){
   to_add <- setdiff(predictor$genes_considered,row.names(gexp))
   artificial_gene_counts <- Matrix::Matrix(0,nrow = length(to_add),ncol = ncol(gexp),
                                            dimnames = list(to_add,colnames(gexp)))
-  Matrix::Matrix(as.array(rbind(gexp,artificial_gene_counts))[predictor$genes_considered,],sparse = TRUE)
+  return(rbind(gexp,artificial_gene_counts)[predictor$genes_considered,])
 }
 
 
@@ -193,7 +193,13 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
     if( !is.null(gexp_test)){gexp_test <- gexp_normalize(gexp_test)}
   }
   if(normalize_adt){
-    adt_train <- Seurat::NormalizeData(adt_train, normalization.method = "CLR", margin = margin)
+    #adding a pseudocount of 0.99 so CLR transform of 0 values doesn't throw an error --> ok if counts overall are not super low
+    #Using 0.99 instead of 1 to make it more easily distinguishable from true 1s during debugging
+    #Better option would likely to ignore these ADT values entirely for training the LM
+    adt_train[adt_train == 0] <- 0.99
+    adt_train <- Matrix::Matrix((t(compositions::clr(t(as.matrix(adt_train))))),sparse = TRUE)
+    # Old version
+    # adt_train <- Seurat::NormalizeData(adt_train, normalization.method = "CLR", margin = margin)
   }
 
   # The way the sets are generated, same gene names should be a given (stem from same dataset just split)
@@ -241,7 +247,7 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
 
   rm(gexp_train,gexp_test)
   print('Fitting linear models')
-  cl <- parallel::makeCluster(n_cores,outfile = 'lm_log.txt')
+  cl <- parallel::makeCluster(n_cores)
   parallel::clusterExport(cl,list("training_set","adt_train_modelling"),envir = environment())
   parallel::clusterEvalQ(cl,library(Matrix))
   results <- pbapply::pblapply(cl = cl, X = 1:ncol(adt_train_modelling), FUN = function(i) {
@@ -253,7 +259,6 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
     })
   })
   parallel::stopCluster(cl)
-  file.remove('lm_log.txt')
   names(results) <- colnames(adt_train_modelling)
   return(list(tsvd_v=trained_tsvd$v,lm_coefficients=results,zscore_relative_to_tsvd = zscore_relative_to_tsvd,
               genes_considered = keep_genes))
@@ -276,7 +281,6 @@ predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE){
   }else{ # assume it is a matrix type
     gexp <- Matrix::Matrix(gexp, sparse = TRUE)
   }
-
   if(normalize_gex){
     gexp <- gexp_normalize(gexp)
   }
@@ -291,8 +295,6 @@ predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE){
     }
     ))
   }
-  gexp <- as.matrix(gexp)
-
   gexp_projected <- gexp %*% predictor$tsvd_v
 
   if(predictor$zscore_relative_to_tsvd == 'after'){
@@ -340,15 +342,15 @@ evaluate_predictor <- function(predictor,gexp_test,adt_test,gexp_layer = 'counts
   predicted_adt <- predict(predictor,gexp_test,layer = gexp_layer, normalize_gex = normalize_gex)
   if(class(adt_test)[1] == "Assay" |class(adt_test)[1] == "Assay5"){ adt_test <- Seurat::GetAssayData(adt_test, layer = adt_layer) }
   if(normalize_adt){
-    adt_test <- t(Seurat::NormalizeData(adt_test, normalization.method = "CLR", margin = margin))
+    adt_test[adt_test == 0] <- 0.99
+    adt_test <- Matrix::Matrix(((compositions::clr(t(as.matrix(adt_test))))),sparse = TRUE)
+    #adt_test <- t(Seurat::NormalizeData(adt_test, normalization.method = "CLR", margin = margin))
   }else{
       # Converting from Matrix::Matrix to base Matrix (and transposing)
       adt_test <- as.matrix(Matrix::t(adt_test))
   }
-
-  p_adt <- subset(predicted_adt,features = which(colnames(predicted_adt) %in% colnames(adt_test)) )
-  t_adt <- subset(adt_test,features = which(colnames(adt_test) %in% colnames(predicted_adt)) )
-
+  p_adt <- subset(predicted_adt,subset = colnames(predicted_adt) %in% colnames(adt_test))
+  t_adt <- (subset(as.matrix(adt_test),subset = colnames(adt_test) %in% colnames(predicted_adt)))
   t_adt <- t_adt[match(rownames(p_adt),rownames(t_adt)),match(colnames(p_adt),colnames(t_adt))]
   err_sq <- (p_adt-t_adt)^2
   # Not sure how to interpret the means of the single model metrics but for now just replicating the behaviour of python code

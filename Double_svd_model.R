@@ -1,9 +1,9 @@
+
 kidney1_seurat <- Seurat::Read10X_h5('C:/Users/mz24b548/Downloads/4plex_DTC_kidney_lung_breast_TotalSeqC_multiplex_Kidney_Cancer1_BC1_AB1_count_sample_filtered_feature_bc_matrix.h5')
 devtools::load_all('R/')
 library(ggplot2)
 plot_comparison <- function(adt1,adt2,xaxis = 'ADT Values 1', yaxis = 'ADT Values 2',title = '',groupings = rep(1,length(adt1))){
-  plot_dat <- data.frame(cbind(adt1,adt2,as.factor(groupings)))
-  plot_dat[,3] <- as.factor(plot_dat[,3])
+  plot_dat <- cbind(adt1,adt2,groupings)
   colnames(plot_dat) <- c('ADT1','ADT2','group')
   comp_plot <- ggplot(plot_dat,aes(x=ADT1,y=ADT2,color = group))+
     geom_point()+
@@ -13,9 +13,6 @@ plot_comparison <- function(adt1,adt2,xaxis = 'ADT Values 1', yaxis = 'ADT Value
     xlab(xaxis) + ylab(yaxis) +
     theme_minimal() +
     coord_equal() +
-    #If x axis = true values and y = prediction --> predictions have much bigger outlier range --> set limits based on true range
-    ylim(c(quantile(adt1,0.02),max(quantile(adt1,0.98),0))) +
-    scale_color_discrete(name = "Cell types", labels = levels(as.factor(groupings))) +
     ggtitle(title) + theme(
       panel.background = element_rect(fill = "white",
                                       colour = "white",
@@ -23,12 +20,12 @@ plot_comparison <- function(adt1,adt2,xaxis = 'ADT Values 1', yaxis = 'ADT Value
       panel.grid.major = element_line(size = 0.5, linetype = 'solid',
                                       colour = "black"),
       panel.grid.minor = element_line(size = 0.25, linetype = 'solid',
-                                      colour = "black"),
-      plot.background = element_rect(fill = "white")
-
+                                      colour = "black")
     )
   return(comp_plot)
 }
+
+
 
 
 kidney1_gex <- kidney1_seurat$`Gene Expression`
@@ -43,119 +40,7 @@ prepped <- prepare_data(combi_seurat)
 prepped_gex <- Seurat::GetAssayData(prepped[['RNA']], layer = 'counts')
 prepped_adt <- Seurat::GetAssayData(prepped[['ADT']], layer = 'counts')
 
-y <- t(as.matrix(prepped_adt))
-
-
-# Which ADT counts are 0 --> clr doesn't add pseudocount but instead leaves them as 0 which introduces potentially even a bigger error
-# Use no log normalization for gene expression BUT potentially for the TSVD projected values --> they should almost never be exactly
-# 0 since they are a linear combination of many different genes
-# Can't simply drop 0 values after CLR since we need the value for tSVD IF we go with ADT tsvd / pca
-# Calculate geometric mean for each cell, calculate CLR for all non-zero counts as if no pseudocount added, replace CLR of zero-count with CLR of values as if it had been 1
-# gmeans_per_cell <- vector(mode = "list", length = ncol(prepped_adt))
-# for(i in 1:ncol(prepped_adt)){
-#   gmeans_per_cell[i] <- exp(mean(log(prepped_adt[prepped_adt[,i] != 0,i])))
-# }
-# prepped_adt <- Matrix::Matrix((t(compositions::clr(t(as.matrix(prepped_adt))))),sparse = TRUE)
-
-# to_replace <- which(as.vector(prepped_adt_no_clr) == 0)
-# for(entry in to_replace){
-#   col <- floor((entry-1)/nrow(prepped_adt)) + 1
-#   row <- ((entry-1) %% nrow(prepped_adt)) + 1
-#   prepped_adt[row,col] <- log(1/gmeans_per_cell[[col]])
-# }
-
-
-# mu = colMeans(t(prepped_adt))
-# adt_pca <- prcomp(t(prepped_adt))
-# # Reconstruction if needed
-# unscaled = adt_pca$x %*% t(adt_pca$rotation)
-# reconstructed = scale(unscaled, center = -mu, scale = FALSE)
-#
-# adt_pca_centered <- adt_pca$x
-# adt_pca_df <- data.frame(as.factor(prepped$cell_type),adt_pca_centered)
-# adt_pca_df[,1] <- as.factor(adt_pca_df[,1])
-# colnames(adt_pca_df)[1] <- 'cell_type'
-# ggplot(adt_pca_df,aes(x = `PC1`, color = cell_type)) + geom_histogram(position = 'identity', fill = NA) +
-#   scale_color_discrete(name = "", labels = levels(as.factor(prepped$cell_type)))
-#
-# adt_clr_centered <- as.matrix(t(prepped_adt))
-# adt_clr_df <- data.frame(as.factor(prepped$cell_type),adt_clr_centered)
-# adt_clr_df[,1] <- as.factor(adt_clr_df[,1])
-# colnames(adt_clr_df)[1] <- 'cell_type'
-#
-# adt_kec_pca <- prcomp(t(as.matrix(prepped_adt)[,prepped$cell_type == 'Kidney epithelial cell']))
-# regular_normed <- t(as.matrix(gexp_normalize(as.matrix(prepped_gex)[,prepped$cell_type == 'Kidney epithelial cell'])))
-
-# Use un-clred ADT data
-sce <- SingleCellExperiment::SingleCellExperiment(list(counts = prepped_gex))
-clusters <- scran::quickCluster(sce)
-sce <- scran::computeSumFactors(sce, clusters=clusters)
-gex_normed_no_log <- scuttle::normalizeCounts(sce,center.size.factors = FALSE, log = FALSE)
-
-all_predis_all_cells <- matrix(NA, nrow = 32,ncol = 1)
-
-for(cell_t in unique(prepped$cell_type)){
-dreg_y <- t(as.matrix(prepped_adt)[,prepped$cell_type == cell_t])
-#Pseudocount --> 0.99 instead of one so it can later be more easily distinguished from true 1 count
-dreg_y[dreg_y == 0] <- 0.99
-# dreg_y[dreg_y == 0.99] <- 0
-dreg_y_scaled <- dreg_y / rowSums(dreg_y)
-train_indices <- 1:floor(nrow(dreg_y_scaled)*2/3)
-test_indices <- (floor(nrow(dreg_y_scaled)*2/3)+1):nrow(dreg_y_scaled)
-gex_tsvd <- sparsesvd::sparsesvd(Matrix::Matrix(t(as.matrix(gex_normed_no_log)[,prepped$cell_type == cell_t]),sparse = TRUE),min(300,length(test_indices)))
-gex_projected <- t(as.matrix(gex_normed_no_log)[,prepped$cell_type == cell_t]) %*% gex_tsvd$v
-c_ilr <- Matrix::Matrix((t(compositions::ilr(as.matrix(dreg_y_scaled)))),sparse = TRUE)
-
-predi_all_this_cell <- matrix(nrow = nrow(c_ilr),ncol = length(test_indices)  )
-
-for(i in 1:nrow(c_ilr)){
-  print(i)
-  lmod <- lm(as.matrix(c_ilr)[i,train_indices] ~ gex_projected[train_indices,])
-  predi_all_this_cell[i,] <- lmod$coefficients[1]+lmod$coefficients[2:length(lmod$coefficients)] %*% t(gex_projected[test_indices,])
-}
-remapped <- Matrix::Matrix((t(compositions::ilrInv(t(as.matrix(predi_all_this_cell))))),sparse = TRUE)
-cell_names <- rownames(dreg_y_scaled)[test_indices]
-colnames(remapped) <- cell_names
-all_predis_all_cells <- cbind(all_predis_all_cells,remapped)
-}
-all_predis_all_cells <- as.matrix(all_predis_all_cells)[,-1]
-which_cells <- colnames(all_predis_all_cells)
-reference <- t(as.matrix(prepped_adt)[,which_cells])
-reference[reference == 0] <- 0.99
-reference <- reference / rowSums(reference)
-for(i in 1:ncol(reference)){
-plot_comparison(log(reference[,i]),log(all_predis_all_cells[i,]), xaxis = 'Log(true fraction)',
-                yaxis = 'Log(Prediction)', groupings = prepped$cell_type[which_cells],title = colnames(reference)[i])
-ggsave(paste0('Prediction_evaluation_plots/',colnames(reference)[i],'_prediction.png'))
-  }
-
-
-predi_all <- matrix(nrow = nrow(adt_kec_pca$x),ncol = ncol(adt_kec_pca$x))
-
-
-
-
-for(i in 1:ncol(adt_kec_pca$x)){
-  print(i)
-  mod <- cv.glmnet(regular_normed,adt_kec_pca$x[,i], alpha = 0)
-  best_lambda <- mod$lambda.min
-  best_model <- glmnet(regular_normed, adt_kec_pca$x[,i], alpha = 0, lambda = best_lambda)
-  predi_all[,i] <- predict.glmnet(best_model,regular_normed)
-}
-
-predi_all_remapped <- predi_all %*% t(adt_kec_pca$rotation)
-mu <- colMeans(t(as.matrix(prepped_adt)[,prepped$cell_type == 'Kidney epithelial cell']))
-predi_all_remapped = scale(predi_all_remapped, center = -mu, scale = FALSE)
-comparison <- t(as.matrix(prepped_adt)[,prepped$cell_type == 'Kidney epithelial cell'])
-
-mod <- cv.glmnet(regular_normed,adt_kec_pca$x[,1], alpha = 0)
-best_lambda <- mod$lambda.min
-best_model <- glmnet(regular_normed, adt_kec_pca$x[,1], alpha = 0, lambda = best_lambda)
-predi <- predict.glmnet(best_model,regular_normed)
-
-
-
-
+prepped_adt <- Matrix::Matrix((t(compositions::clr(t(as.matrix(prepped_adt))))),sparse = TRUE)
 adt_df <- data.frame(prepped_adt)
 adt_df <- data.frame(cbind(as.factor(prepped$cell_type),t(adt_df)))
 # adt_df <- data.frame(cbind(prepped$seurat_clusters,t(adt_df)))

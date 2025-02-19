@@ -41,3 +41,6 @@ Top50genes_overlap.png
 Top_50genes_overlap_CD19_CD19.png
 Top_50genes_overlap_CD326_EPCAM.png
 Top_50genes_overlap_CD3_CD3E.png
+/Tabula_sapiens_classifier_input
+/Three_tissue_input_data
+*.rds
