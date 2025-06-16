@@ -10,24 +10,33 @@ import matplotlib.pyplot as plt
 import stepmix
 
 
-with open('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/ADT_CLR','rb') as file:
-        adt_matrix = pickle.load(file)
+# with open('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/ADT_CLR','rb') as file:
+#         adt_matrix = pickle.load(file)
 
-adt_matrix = adt_matrix.transpose()
-adt_matrix = adt_matrix[0:7532,0:2]
+# adt_matrix = adt_matrix.transpose()
+# adt_matrix = adt_matrix[0:7532,0:2]
 
-with open('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/GEX_normed','rb') as file:
+# with open('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/GEX_normed','rb') as file:
+#         gex_matrix = pickle.load(file)
+
+# gex_matrix = gex_matrix.transpose()
+
+with open('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/GEX_raw','rb') as file:
         gex_matrix = pickle.load(file)
 
-gex_matrix = gex_matrix.transpose()
+with open('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/ADT_raw','rb') as file:
+        gex_matrix = pickle.load(file)
 
-print('a')
 
 
-smix = stepmix.StepMix(n_components = 3,n_steps = 3, measurement = 'covariate', structural = 'gaussian_full')
-svd = TruncatedSVD(n_components= 300)
-X_svd = svd.fit_transform(gex_matrix)
-smix.fit(X_svd,adt_matrix)
+
+# print('a')
+
+
+# smix = stepmix.StepMix(n_components = 3,n_steps = 3, measurement = 'covariate', structural = 'gaussian_full')
+# svd = TruncatedSVD(n_components= 300)
+# X_svd = svd.fit_transform(gex_matrix)
+# smix.fit(X_svd,adt_matrix)
 
 
 
@@ -47,25 +56,25 @@ smix.fit(X_svd,adt_matrix)
 # adt_svd = TruncatedSVD(n_components= 31)
 # adt_matrix = adt_matrix[0:7532,:]
 # Y_svd = adt_svd.fit_transform(adt_matrix)
-Y_svd = adt_matrix
+# Y_svd = adt_matrix
 
-classification_init = np.ones(Y_svd[:,0].shape[0])
-for i in range(Y_svd[:,0].shape[0]):
-        if Y_svd[i,0] <= np.quantile(Y_svd[:,0],0.33):
-                classification_init[i] = 0
-        elif Y_svd[i,0] <= np.quantile(Y_svd[:,0],0.66):
-                classification_init[i] = 1
-        else:
-                classification_init[i] = 2
+# classification_init = np.ones(Y_svd[:,0].shape[0])
+# for i in range(Y_svd[:,0].shape[0]):
+#         if Y_svd[i,0] <= np.quantile(Y_svd[:,0],0.33):
+#                 classification_init[i] = 0
+#         elif Y_svd[i,0] <= np.quantile(Y_svd[:,0],0.66):
+#                 classification_init[i] = 1
+#         else:
+#                 classification_init[i] = 2
         
 
-classifier = LogisticRegression(multi_class = 'multinomial', solver = 'lbfgs', max_iter = 10000)
-classifier.fit(X_svd,classification_init)
+# classifier = LogisticRegression(multi_class = 'multinomial', solver = 'lbfgs', max_iter = 10000)
+# classifier.fit(X_svd,classification_init)
 
-classes = classifier.predict(X_svd)
-lreg1 = LinearRegression()
-lreg2 = LinearRegression()
-lreg3 = LinearRegression()
+# classes = classifier.predict(X_svd)
+# lreg1 = LinearRegression()
+# lreg2 = LinearRegression()
+# lreg3 = LinearRegression()
 
 # for i in range(100):
 #  print(i)

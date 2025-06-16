@@ -176,7 +176,7 @@ scLinear <- function(object, remove_doublets = TRUE, low_qc_cell_removal = TRUE,
 #' @export
 fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
                             layer_gex = "counts", layer_adt = "counts",
-                            normalize_gex = TRUE,normalize_adt = TRUE, margin = 2,
+                            normalize_gex = TRUE,normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2,
                             n_components = 300, zscore_relative_to_tsvd = 'after',n_cores = NULL){
   # If no number is specified, get number of available cores and omit 4 to avoid using up all system resources
   if(is.null(n_cores)){n_cores <- parallelly::availableCores(omit = 4)}
@@ -196,10 +196,14 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
     #adding a pseudocount of 0.99 so CLR transform of 0 values doesn't throw an error --> ok if counts overall are not super low
     #Using 0.99 instead of 1 to make it more easily distinguishable from true 1s during debugging
     #Better option would likely to ignore these ADT values entirely for training the LM
+    if(adt_norm_method == 'CLR'){
     adt_train[adt_train == 0] <- 0.99
     adt_train <- Matrix::Matrix((t(compositions::clr(t(as.matrix(adt_train))))),sparse = TRUE)
-    # Old version
-    # adt_train <- Seurat::NormalizeData(adt_train, normalization.method = "CLR", margin = margin)
+    }else if(adt_norm_method == 'legacy'){
+    adt_train <- Seurat::NormalizeData(adt_train, normalization.method = "CLR", margin = margin)
+    }else{
+      Print('If normalize adt is set to TRUE (default), adt_norm_method has to be set to either CLR or legacy')
+    }
   }
 
   # The way the sets are generated, same gene names should be a given (stem from same dataset just split)
@@ -336,15 +340,24 @@ predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE){
 #'
 #' @return List of metrics for model performance (Mean RMSE of all models and ADT-specific correlation coefficients between predicted and measured ADT Values)
 #' @export
-evaluate_predictor <- function(predictor,gexp_test,adt_test,gexp_layer = 'counts', adt_layer = 'counts', normalize_gex = TRUE, normalize_adt = TRUE, margin = 2){
+evaluate_predictor <- function(predictor,gexp_test,adt_test,gexp_layer = 'counts', adt_layer = 'counts', normalize_gex = TRUE,
+                               normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2){
 
   # ToFix --> can't compare CLR if different subsets were considered since it's compositional data
   predicted_adt <- predict(predictor,gexp_test,layer = gexp_layer, normalize_gex = normalize_gex)
   if(class(adt_test)[1] == "Assay" |class(adt_test)[1] == "Assay5"){ adt_test <- Seurat::GetAssayData(adt_test, layer = adt_layer) }
   if(normalize_adt){
-    adt_test[adt_test == 0] <- 0.99
-    adt_test <- Matrix::Matrix(((compositions::clr(t(as.matrix(adt_test))))),sparse = TRUE)
-    #adt_test <- t(Seurat::NormalizeData(adt_test, normalization.method = "CLR", margin = margin))
+    #adding a pseudocount of 0.99 so CLR transform of 0 values doesn't throw an error --> ok if counts overall are not super low
+    #Using 0.99 instead of 1 to make it more easily distinguishable from true 1s during debugging
+    #Better option would likely to ignore these ADT values entirely for training the LM
+    if(adt_norm_method == 'CLR'){
+      adt_test[adt_test == 0] <- 0.99
+      adt_test <- Matrix::Matrix(((compositions::clr(t(as.matrix(adt_test))))),sparse = TRUE)
+    }else if(adt_norm_method == 'legacy'){
+      adt_test <- Matrix::t(Seurat::NormalizeData(adt_test, normalization.method = "CLR", margin = margin))
+    }else{
+      Print('If normalize adt is set to TRUE (default), adt_norm_method has to be set to either CLR or legacy')
+    }
   }else{
       # Converting from Matrix::Matrix to base Matrix (and transposing)
       adt_test <- as.matrix(Matrix::t(adt_test))

@@ -44,3 +44,27 @@ Top_50genes_overlap_CD3_CD3E.png
 /Tabula_sapiens_classifier_input
 /Three_tissue_input_data
 *.rds
+.ipynb_checkpoints/TOSICA_Tutorial-checkpoint.ipynb
+.ipynb_checkpoints/Python_testing_jupyter_notebook-checkpoint.ipynb
+.ipynb_checkpoints/Python_testing_jupyter_notebook-checkpoint.ipynb
+.Rhistory
+.Rhistory
+3TModel_test_gex_normed.txt
+3TModel_test_metadata_celltype.txt
+3TModel_test_predicted_ADT.txt
+3TModel_prediction_vs_true/Error_waterfall.png
+.ipynb_checkpoints/Python_testing_jupyter_notebook-checkpoint.ipynb
+3TModel_test_true_ADT.txt
+adt based classification.png
+ADT_dist_by_celltype.jpg
+ADT_dist_total.jpg
+gene based classification.png
+gene_based_classification.png
+Jupyter_notebook_direct_python_copy.py
+neurips_training_set_proteins.txt
+runs/Jun11_12-47-27_dbmr-975/events.out.tfevents.1749638847.dbmr-975.31632.0
+runs/Jun11_12-50-33_dbmr-975/events.out.tfevents.1749639033.dbmr-975.31632.1
+runs/Jun11_12-51-16_dbmr-975/events.out.tfevents.1749639076.dbmr-975.31632.2
+runs/Jun11_13-07-47_dbmr-975/events.out.tfevents.1749640067.dbmr-975.31632.3
+three_tissue_model_proteins.txt
+Tabsap_bladder_gene_names.txt

@@ -27,7 +27,8 @@ devtools::load_all('R/')
 # colnames(adt_df) <- c('prediction','cell_type')
 # ggplot(adt_df,aes(x = `prediction`, color = cell_type)) + geom_histogram(position = 'identity', fill = NA) +
 #   scale_color_discrete(name = "", labels = levels(as.factor(tsap_dat$cell_type)))
-tsap_dat <- readRDS('Tabula_sapiens_data/tabula_sapiens_blood.rds')
+# tsap_dat <- readRDS('Tabula_sapiens_data/tabula_sapiens_blood.rds')
+tsap_dat <- readRDS('Tabula_sapiens_data/Tabula_sapiens_bladder.rds.rds')
 rna_counts <- Seurat::GetAssayData(tsap_dat@assays[["RNA"]],layer = 'counts')
 feature_names <- tsap_dat@assays$RNA@meta.features$feature_name
 rownames(rna_counts) <- feature_names
@@ -77,21 +78,25 @@ classifications$`True annotation` <- factor(classifications$`True annotation`,
                                             levels = order)
 
 
-rna_counts_normed <-
+rna_counts_normed <- gexp_normalize(rna_counts)
+rna_counts_normed <- filter_input_genes(rna_counts_normed,predictor)
 
 gex_filtered <- filter_input_genes(rna_counts,predictor)
 gex_projected <- Matrix::t(gex_filtered) %*% predictor$tsvd_v
 gex_train <- Matrix::t(Matrix::t(gex_projected)[,train_indices])
 gex_projected_svd_train <- reticulate::r_to_py(gex_train)
 
+
 gex_tabsap <- reticulate::r_to_py(rna_counts)
 #Easier than passing all row-/ & columnnames to py and doing filtering there
 gex_filtered <- reticulate::r_to_py(gex_filtered)
+gex_normed <- reticulate::r_to_py(rna_counts_normed)
 adt_predictions_for_tabsap <- reticulate::r_to_py(predictions)
 tsvd_projector <- reticulate::r_to_py(predictor$tsvd_v)
 tabsap_annotations <- reticulate::r_to_py(tsap_dat$cell_type)
 
 reticulate::py_save_object(gex_tabsap,'Tabula_sapiens_classifier_input/gene_expression_tabsap')
+reticulate::py_save_object(gex_normed,'Tabula_sapiens_classifier_input/gene_expression_tabsap_normed')
 reticulate::py_save_object(adt_predictions_for_tabsap,'Tabula_sapiens_classifier_input/adt_predictions_for_tabsap')
 reticulate::py_save_object(tsvd_projector,'Tabula_sapiens_classifier_input/tsvd_projector_from_3tmodel')
 reticulate::py_save_object(tabsap_annotations,'Tabula_sapiens_classifier_input/tabsap_annotations')
