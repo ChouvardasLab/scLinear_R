@@ -177,7 +177,7 @@ scLinear <- function(object, remove_doublets = TRUE, low_qc_cell_removal = TRUE,
 fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
                             layer_gex = "counts", layer_adt = "counts",
                             normalize_gex = TRUE,normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2,
-                            n_components = 300, zscore_relative_to_tsvd = 'after',n_cores = NULL){
+                            n_components = 300, zscore_relative_to_tsvd = 'after',n_cores = NULL, reused_tsvd = NULL){
   # If no number is specified, get number of available cores and omit 4 to avoid using up all system resources
   if(is.null(n_cores)){n_cores <- parallelly::availableCores(omit = 4)}
   # If objects are passed as matrices, leave as is. If passed as Seurat objects --> extract count data for assays
@@ -198,7 +198,16 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
     #Better option would likely to ignore these ADT values entirely for training the LM
     if(adt_norm_method == 'CLR'){
     adt_train[adt_train == 0] <- 0.99
+    # drop_mask = adt_train == 0
+    # gmeans <- apply(adt_train,2,function(x){exp(mean(log(x[x>0])))})
+    # Treat each 0 value as NA for  CLR BUT replace it afterwards
+    # by the value it would have gotten if the count had been 1 (ignoring effect of the additional 1 on geometric mean)
+    # replace <- log(1/gmeans)
+    # replace <- matrix(rep(replace,nrow(adt_train)),nrow = nrow(adt_train),byrow = TRUE)
     adt_train <- Matrix::Matrix((t(compositions::clr(t(as.matrix(adt_train))))),sparse = TRUE)
+    # adt_train <- Matrix::Matrix((t(compositions::ilr(t(as.matrix(adt_train))))),sparse = TRUE)
+
+    # adt_train[adt_train == 0 & drop_mask] <- replace[adt_train == 0 & drop_mask]
     }else if(adt_norm_method == 'legacy'){
     adt_train <- Seurat::NormalizeData(adt_train, normalization.method = "CLR", margin = margin)
     }else{
@@ -221,12 +230,22 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
     }
     ))
   }
+
+  # When doing train test split to evaluate model performance and then retraining the model on full data
+  # --> If gex_test was used in the original tsvd, there is no reason to recalculate it
+  # Since tSVD calculation is one of the most time, consuming steps, include option to pass previously calculated svd projector
+  if(!is.null(reused_tsvd)){
+  print('Reusing tSVD projector matrix')
+    projector <- reused_tsvd
+  }else{
   # Create tSVD decomposition
   print('Calculating truncated singular value decomposition - for large input matrices this may take several minutes')
   trained_tsvd <- sparsesvd::sparsesvd(training_set,rank = n_components)
   print('tSVD done')
+  projector <- trained_tsvd$v
+  }
   # apply tSVD projection on input data
-  training_set <- training_set %*% trained_tsvd$v
+  training_set <- training_set %*% projector
   # z-score normalizaton
 
   if(zscore_relative_to_tsvd == 'after'){
@@ -264,7 +283,7 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
   })
   parallel::stopCluster(cl)
   names(results) <- colnames(adt_train_modelling)
-  return(list(tsvd_v=trained_tsvd$v,lm_coefficients=results,zscore_relative_to_tsvd = zscore_relative_to_tsvd,
+  return(list(tsvd_v=projector,lm_coefficients=results,zscore_relative_to_tsvd = zscore_relative_to_tsvd,
               genes_considered = keep_genes))
 }
 
@@ -279,18 +298,44 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
 #' @return Predicted ADT levels. If ADT levels have been normalized during predictor training (default behaviour), the predicted ADT levels should also be considered 'normalized' in the same way.
 #'
 #' @export
-predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE){
+predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE,convert = 'None'){
+  # TODO: Make it properly part of package requirements
+  library(biomaRt)
+  library(dplyr)
   if(any(class(gexp) %in% c("Seurat", "Assay", "Assay5"))){
     gexp <- Seurat::GetAssayData(gexp, layer = layer)
   }else{ # assume it is a matrix type
     gexp <- Matrix::Matrix(gexp, sparse = TRUE)
   }
+
+  #Normalization first based on all genes then filter might be more accurate but takes much longer
+  if(convert == 'ENSG_to_HGNC'){
+    gene_ids <- rownames(gexp)
+    ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+    gnames <- getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),
+                    filters = 'ensembl_gene_id',
+                    values = gene_ids,
+                    mart = ensembl)
+    gnames <- gnames[gnames$hgnc_symbol != '',]
+    keep_genes <-gene_ids[gene_ids %in% gnames$ensembl_gene_id]
+    gexp <- Matrix::t(Matrix::t(gexp)[,keep_genes])
+    ambiguous_symbol_mappings <- names(which(table(gnames$ensembl_gene_id) > 1))
+    mapping_options <- gnames[gnames$ensembl_gene_id %in% ambiguous_symbol_mappings,'hgnc_symbol']
+    # intersect(mapping_options,predictor$genes_considered)
+    gnames <- gnames %>% group_by(ensembl_gene_id) %>% summarise(hgnc_symbol = head(hgnc_symbol,1))
+    rownames(gnames) <- gnames$ensembl_gene_id
+    rownames(gexp) <- gnames[rownames(gexp),]$hgnc_symbol
+  }
+  gexp <- filter_input_genes(gexp,predictor)
+
+  missing <- setdiff(predictor$genes_considered,rownames(gexp))
+  cat(paste0('Missing counts for ',length(missing),' genes which were used for training of the ADT prediction model'))
+
   if(normalize_gex){
     gexp <- gexp_normalize(gexp)
   }
 
   # Bring into shape cells x genes (done during training in the step which combines train & test)
-  gexp <- filter_input_genes(gexp,predictor)
   gexp <- Matrix::t(gexp)
 
   if(predictor$zscore_relative_to_tsvd == 'before'){
@@ -341,10 +386,9 @@ predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE){
 #' @return List of metrics for model performance (Mean RMSE of all models and ADT-specific correlation coefficients between predicted and measured ADT Values)
 #' @export
 evaluate_predictor <- function(predictor,gexp_test,adt_test,gexp_layer = 'counts', adt_layer = 'counts', normalize_gex = TRUE,
-                               normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2){
-
+                               normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2, convert = 'None'){
   # ToFix --> can't compare CLR if different subsets were considered since it's compositional data
-  predicted_adt <- predict(predictor,gexp_test,layer = gexp_layer, normalize_gex = normalize_gex)
+  predicted_adt <- predict(predictor,gexp_test,layer = gexp_layer, normalize_gex = normalize_gex, convert = convert)
   if(class(adt_test)[1] == "Assay" |class(adt_test)[1] == "Assay5"){ adt_test <- Seurat::GetAssayData(adt_test, layer = adt_layer) }
   if(normalize_adt){
     #adding a pseudocount of 0.99 so CLR transform of 0 values doesn't throw an error --> ok if counts overall are not super low
@@ -535,6 +579,9 @@ feature_importance <- function(predictor,gexp,layer_gexp,normalize_gex = TRUE,n_
 #' }
 gexp_normalize <- function(gexp_matrix, center.size.factors = FALSE, log = FALSE, ...){
   ## normalize data GEX
+  #For some reason the computeSumFactors function throws an error if input id dgRMatrix
+  if(class(gexp_matrix) == 'dgRMatrix'){gexp_matrix <- as(gexp_matrix, "CsparseMatrix")}
+
   sce <- SingleCellExperiment::SingleCellExperiment(list(counts = gexp_matrix))
   clusters <- scran::quickCluster(sce)
   sce <- scran::computeSumFactors(sce, clusters=clusters)

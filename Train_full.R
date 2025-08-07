@@ -1,16 +1,18 @@
 #Trained on model 'as is' --> using the somewhat 'wrong' Seurat CLR and no further TSVD on ADT for ILR transform
+rm(list=ls())
 devtools::load_all('R/')
 set.seed(50)
 for(file in dir('Three_tissue_input_data/')){
    data_source <- stringr::str_match(file,
                      '.*multiplex_([a-zA-Z]+_[a-zA-Z1-2]+)_.*')[,2]
+   # if(data_source != 'Lung_Cancer'){next}
    data <- Seurat::Read10X_h5(paste0('Three_tissue_input_data/',file))
    gex <- data$`Gene Expression`
    adt <- data$`Antibody Capture`
    combi_seurat <- Seurat::CreateSeuratObject(counts = gex, assay = 'RNA')
    adt_seurat <- Seurat:: CreateAssayObject(counts = adt)
    combi_seurat[["ADT"]] <- adt_seurat
-   assign(data_source,prepare_data(combi_seurat))
+   assign(data_source,prepare_data(combi_seurat,anno_level = 1))
    rm(adt,adt_seurat,combi_seurat,data,gex)
 }
 
@@ -22,27 +24,79 @@ train_cols <- colnames(merged)[indx[1:floor(0.75*ncol(merged))]]
 test_cols <- colnames(merged)[indx[(floor(0.75*ncol(merged))+1):ncol(merged)]]
 
 # In R it seems like rowaccess is faster for dgC and colaccess faster for dgE even though it should generally be the other way around
-# For some reason, reordering is not respected as in
+# For some reason, reordering is not respected?
 # gex_train <- Seurat::GetAssayData(all_train@assays[["RNA"]],layer = 'counts')
 # gex_test <- Seurat::GetAssayData(all_test@assays[["RNA"]],layer = 'counts')
 # adt_train <- Seurat::GetAssayData(all_train@assays[["ADT"]],layer = 'counts')
 # adt_test <- Seurat::GetAssayData(all_test@assays[["ADT"]],layer = 'counts')
 gex = Seurat::GetAssayData(merged@assays[["RNA"]],layer = 'counts')
 adt = Seurat::GetAssayData(merged@assays[["ADT"]],layer = 'counts')
+# keep <- setdiff(rownames(adt),c("CD19-CD19","CD25-IL2RA","Mouse-IgG1","Mouse-IgG2b","TIGIT-TIGIT","CD171-L1CAM","CD140a-PDGFRA","CD138-SDC1","Podoplanin-PDPN","Mouse-IgG2a"))
+# adt <- adt[keep,]
+
 gex_train = Matrix::t(Matrix::t(gex)[train_cols,])
 adt_train = Matrix::t(Matrix::t(adt)[train_cols,])
 gex_test = Matrix::t(Matrix::t(gex)[test_cols,])
 adt_test = Matrix::t(Matrix::t(adt)[test_cols,])
+#By removing the bad models, the good ones don't get notably better
+#Try separation based on predicted fraction moreso than the CLR itself
+#Usually show similar degree of separation, sometimes better, sometimes worse
 
+
+# Change of CLR not 0.99 but instead set NA --> suddenly predictions don't add up to 0 anymore? What is going on?
+
+# gex_kidney_epi <- t(t(gex)[merged$cell_type == 'Kidney epithelial cell',])
+# adt_kidney_epi <- t(t(adt)[merged$cell_type == 'Kidney epithelial cell',])
+# indx <- sample(1:ncol(gex_kidney_epi), size = ncol(gex_kidney_epi), replace = FALSE)
+# train_cols <- colnames(gex_kidney_epi)[indx[1:floor(0.75*ncol(gex_kidney_epi))]]
+# test_cols <- colnames(gex_kidney_epi)[indx[(floor(0.75*ncol(gex_kidney_epi))+1):ncol(gex_kidney_epi)]]
+# gex_train = Matrix::t(Matrix::t(gex_kidney_epi)[train_cols,])
+# adt_train = Matrix::t(Matrix::t(adt_kidney_epi)[train_cols,])
+# gex_test = Matrix::t(Matrix::t(gex_kidney_epi)[test_cols,])
+# adt_test = Matrix::t(Matrix::t(adt_kidney_epi)[test_cols,])
 
 train_model <- fit_predictor(gex_train,adt_train,gexp_test = gex_test)
-ev <- evaluate_predictor(train_model,gex_test,adt_test)
 test_predictions <- predict(train_model,gex_test)
+ev <- evaluate_predictor(train_model,gex_test,adt_test)
+# test_predictions_clr <- Matrix::Matrix((t(compositions::ilr2clr(test_predictions))),sparse = TRUE)
+
 adt_test[adt_test == 0] <- 0.99
-reference <- Matrix::Matrix(((compositions::clr(t(as.matrix(adt_test))))),sparse = TRUE)
-errors <- test_predictions - reference
+# drop_mask <- adt_test == 0
+# drop_mask <- t(drop_mask)
+reference <- Matrix::Matrix((t(compositions::clr(t(as.matrix(adt_test))))),sparse = TRUE)
+errors <- test_predictions - t(reference)
 # # Unnormed counts are integers so all 0.99s are artificial --> no chance of accidentally modifying an original non-zero value
 # adt_test[adt_test == 0.99] <- 0
+coeff_mat <- matrix(ncol = 301)
+for(mod in train_model$lm_coefficients){
+  coeff_mat <- rbind(coeff_mat,mod)
+}
+coeff_mat <- coeff_mat[2:nrow(coeff_mat),]
+
+gex_normed <- gexp_normalize(gex_train)
+gex_normed <- filter_input_genes(gex_normed,train_model)
+gex_projected <- t(gex_normed) %*% train_model$tsvd_v
+
+
+adt_train_clr <- adt_train
+adt_train_clr[adt_train_clr == 0] <- 0.99
+adt_train_clr <- Matrix::Matrix((t(compositions::clr(t(as.matrix(adt_train_clr))))),sparse = TRUE)
+coeff_mat2 <- matrix(ncol = 301)
+for(i in 1:32){
+  coeff_mat2 <- rbind(coeff_mat2,lm(adt_train_clr[i,] ~as.matrix(gex_projected))$coefficients)
+}
+coeff_mat2 <- coeff_mat2[2:nrow(coeff_mat2),]
+gex_z <- t(apply(gex_projected,1,function(x){(x-mean(x))/sd(x)}))
+
+predicted <- gex_projected %*% t(coeff_mat2[,2:301])
+predicted <- as.data.frame(t(t(predicted)+coeff_mat2[,1]))
+#Note - a lot of the error in prediction of e.g. CD8A is explained by the error in reconstructing the CD8A RNA profile from TSVD
+# --> the TSVD reonstruction is roughly ok but the errors it makes correlated strongly to ADT prediction error
+# Additional note: CD4 & CD8 seem to be anticorrelated. The 'reconstruction errors' from tSVD
+# For CD4 and CD8A don't form a circle (uncorrelated) but rather a cross
+# True for a lot of genes combinations, even ones not used as marker --> Their respective reconstruction errors
+# Seem connected (not direct linear correlation but when plotted there are distinct clusters and 'gaps' in the error distribution)
+# Gene data very sparse --> usually 0
 
 # Train on ALL data (no train test split since we won't evaluate it again)
 gex_all <- Seurat::GetAssayData(merged@assays[["RNA"]],layer = 'counts')
@@ -176,4 +230,14 @@ plot_comparison(as.vector(reference[1:1000,]),as.vector(test_predictions[1:1000,
 
 
 train_model$lm_coefficients
+
+
+pldf <- data.frame(reference_count = testref[2,], total_adt = colSums(testref),error = errors[,2],total_rna = colSums(gex_test))
+
+
+
+
+ref_df <- as.data.frame(t(reference))
+
+
 
