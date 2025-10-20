@@ -14,7 +14,9 @@ evaluate_predictor(
   adt_layer = "counts",
   normalize_gex = TRUE,
   normalize_adt = TRUE,
-  margin = 2
+  adt_norm_method = "CLR",
+  margin = 2,
+  convert = "None"
 )
 }
 \arguments{

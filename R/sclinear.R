@@ -108,8 +108,77 @@ filter_input_genes <- function(gexp,predictor){
   return(rbind(gexp,artificial_gene_counts)[predictor$genes_considered,])
 }
 
+# Similar to filter input genes but with mapping between ENSG IDs and HGNC gene symbols built in
+match_genesets <- function(reference,newdat){
+  # How to import !! for sym without loading the whole library?
+  library(dplyr)
+  ensembl =  biomaRt::useMart("ensembl",dataset="hsapiens_gene_ensembl")
+  gene_identifiers <- biomaRt::getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),mart = ensembl)
+  # Drop empty mappings
+  gene_identifiers <- gene_identifiers[gene_identifiers$ensembl_gene_id != '' & gene_identifiers$hgnc_symbol != '',]
+  # Determine which id type was used for both datasets
+  matches_gex_ensembl <- length(intersect(rownames(reference),gene_identifiers$ensembl_gene_id))
+  matches_gex_hgnc <- length(intersect(rownames(reference),gene_identifiers$hgnc_symbol))
+  matches_predictor_input_ensembl <- length(intersect(rownames(newdat),gene_identifiers$ensembl_gene_id))
+  matches_predictor_input_hgnc <- length(intersect(rownames(newdat),gene_identifiers$hgnc_symbol))
 
+  id_type_gex <- 'Undetermined'
+  id_type_prediction_input <- 'Undetermined'
 
+  if(matches_gex_ensembl > matches_gex_hgnc & matches_gex_ensembl > 0.3 * length(unique(rownames(reference)))){
+    id_type_gex <- 'ensembl_gene_id'
+  }else if(matches_gex_ensembl < matches_gex_hgnc & matches_gex_hgnc > 0.3 * length(unique(rownames(reference)))){
+    id_type_gex <- 'hgnc_symbol'
+  }
+  if(matches_predictor_input_ensembl > matches_predictor_input_hgnc & matches_predictor_input_ensembl > 0.3 * length(unique(rownames(newdat)))){
+    id_type_prediction_input <- 'ensembl_gene_id'
+  }else if(matches_predictor_input_ensembl < matches_predictor_input_hgnc & matches_predictor_input_hgnc > 0.3 * length(unique(rownames(newdat)))){
+    id_type_prediction_input <- 'hgnc_symbol'
+  }
+
+  if('Undetermined' %in% c(id_type_gex,id_type_prediction_input)){
+    stop("Unable to determine ID type (ENSG / HGNC / other?) for genes used in gene counts either for the dataset used in model training
+          or the one it is being applied to now. Manual translation between gene identifiers required")
+  }
+  if(id_type_gex != id_type_prediction_input){
+    sym_id_type_gex <- sym(id_type_gex)
+    sym_id_type_prediction_input <- sym(id_type_prediction_input)
+    mapping_options <- gene_identifiers %>% filter(!!sym_id_type_gex %in% rownames(reference) &
+                                                   !!sym_id_type_prediction_input %in% rownames(newdat)
+    )
+    ambiguous <- which(table(mapping_options$hgnc_symbol) > 1)
+    if(length(ambiguous) > 0){
+      # Avoiding paste so print keeps clean data frame structure
+      print('Ambiguous mappings between training data and new input for the following genes: ')
+      print(mapping_options %>% filter(hgnc_symbol %in% names(ambiguous)))
+
+      # ENSG IDs seem to be unique , HGNC ids can have different ENSG IDs
+      # If training data used HGNC --> aggregate all ENSG ids from new count mat
+      # If training data used ENSG ID --> unclear how to split counts --> drop
+      # Haven't figured out how to aggregate rows without converting to non-sparse matrix or very time consuming functions
+      # For now just drop all ambiguous mappings
+      # if(id_type_prediction_input == 'hgnc_symbol'){
+      mapping_options <- mapping_options %>% filter(!(hgnc_symbol %in% names(ambiguous)))
+      # }
+    }
+
+    # Can't left join Csparse matrices and converting them would require tons of space --> handle names separately
+
+    rownames_prediction_input <- data.frame(rownames(newdat))
+    colnames(rownames_prediction_input)[1] <- id_type_prediction_input
+    rownames_prediction_input <- rownames_prediction_input %>% left_join(mapping_options, by = join_by(!!sym_id_type_prediction_input == !!sym_id_type_prediction_input))
+    rownames(newdat) <- rownames_prediction_input %>% pull(!!sym_id_type_gex)
+    newdat <- newdat[!is.na(rownames(newdat)),]
+
+  }
+  to_add <- setdiff(rownames(reference),rownames(newdat))
+  # Buffer missing gene counts with 0
+  artificial_gene_counts <- Matrix::Matrix(0,nrow = length(to_add),ncol = ncol(newdat),
+                                           dimnames = list(to_add,colnames(newdat)))
+  # Add together original data and buffer 0 and arrange the rows in the same order as the genes were ordered in the training data
+  newdat <- rbind(newdat,artificial_gene_counts)[rownames(reference),]
+  return(newdat)
+}
 
 
 #' Predict modalities based on gene expression data
@@ -309,23 +378,52 @@ predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE,convert = '
   }
 
   #Normalization first based on all genes then filter might be more accurate but takes much longer
-  if(convert == 'ENSG_to_HGNC'){
-    gene_ids <- rownames(gexp)
-    ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
-    gnames <- getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),
-                    filters = 'ensembl_gene_id',
-                    values = gene_ids,
-                    mart = ensembl)
-    gnames <- gnames[gnames$hgnc_symbol != '',]
-    keep_genes <-gene_ids[gene_ids %in% gnames$ensembl_gene_id]
-    gexp <- Matrix::t(Matrix::t(gexp)[,keep_genes])
-    ambiguous_symbol_mappings <- names(which(table(gnames$ensembl_gene_id) > 1))
-    mapping_options <- gnames[gnames$ensembl_gene_id %in% ambiguous_symbol_mappings,'hgnc_symbol']
-    # intersect(mapping_options,predictor$genes_considered)
-    gnames <- gnames %>% group_by(ensembl_gene_id) %>% summarise(hgnc_symbol = head(hgnc_symbol,1))
-    rownames(gnames) <- gnames$ensembl_gene_id
-    rownames(gexp) <- gnames[rownames(gexp),]$hgnc_symbol
+
+  #Determine whether ENSG IDs or 'Gene names' were used in count matrices of
+  #a) Counts used for model training
+  #b) Counts to which model is now being applied to
+  ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+  gene_identifiers <- getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),mart = ensembl)
+
+  gene_identifiers_new <- rownames(gexp)
+  gene_identifiers_predictor <- predictor$genes_considered
+
+  matches_gex_ensembl <- length(intersect(gene_identifiers_new,gene_identifiers$ensembl_gene_id))
+  matches_gex_hgnc <- length(intersect(gene_identifiers_new,gene_identifiers$hgnc_symbol))
+  matches_predictor_input_ensembl <- length(intersect(rownames(gex),gene_identifiers$ensembl_gene_id))
+  matches_predictor_input_hgnc <- length(intersect(rownames(gex),gene_identifiers$hgnc_symbol))
+
+  id_type_gex <- 'Undetermined'
+  id_type_predictor_input <- 'Undetermined'
+
+  if(matches_gex_ensembl > matches_gex_hgnc & matches_gex_ensembl > 0.3 * length(unique(rownames(gex)))){
+    id_type_gex <- 'ensembl_gene_id'
+  }else if(matches_gex_ensembl < matches_gex_hgnc & matches_gex_hgnc > 0.3 * length(unique(rownames(gex)))){
+    id_type_gex <- 'hgnc_symbol'
   }
+  if(matches_predictor_input_ensembl > matches_predictor_input_hgnc & matches_predictor_input_ensembl > 0.3 * length(unique(rownames(gex)))){
+    id_type_predictor_input <- 'ensembl_gene_id'
+  }else if(matches_predictor_input_ensembl < matches_predictor_input_hgnc & matches_predictor_input_hgnc > 0.3 * length(unique(rownames(gex)))){
+    id_type_predictor_input <- 'hgnc_symbol'
+  }
+
+  # if(convert == 'ENSG_to_HGNC'){
+  #   gene_ids <- rownames(gexp)
+  #   ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
+  #   gnames <- getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),
+  #                   filters = 'ensembl_gene_id',
+  #                   values = gene_ids,
+  #                   mart = ensembl)
+  #   gnames <- gnames[gnames$hgnc_symbol != '',]
+  #   keep_genes <-gene_ids[gene_ids %in% gnames$ensembl_gene_id]
+  #   gexp <- Matrix::t(Matrix::t(gexp)[,keep_genes])
+  #   ambiguous_symbol_mappings <- names(which(table(gnames$ensembl_gene_id) > 1))
+  #   mapping_options <- gnames[gnames$ensembl_gene_id %in% ambiguous_symbol_mappings,'hgnc_symbol']
+  #   # intersect(mapping_options,predictor$genes_considered)
+  #   gnames <- gnames %>% group_by(ensembl_gene_id) %>% summarise(hgnc_symbol = head(hgnc_symbol,1))
+  #   rownames(gnames) <- gnames$ensembl_gene_id
+  #   rownames(gexp) <- gnames[rownames(gexp),]$hgnc_symbol
+  # }
   gexp <- filter_input_genes(gexp,predictor)
 
   missing <- setdiff(predictor$genes_considered,rownames(gexp))
@@ -389,6 +487,7 @@ evaluate_predictor <- function(predictor,gexp_test,adt_test,gexp_layer = 'counts
                                normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2, convert = 'None'){
   # ToFix --> can't compare CLR if different subsets were considered since it's compositional data
   predicted_adt <- predict(predictor,gexp_test,layer = gexp_layer, normalize_gex = normalize_gex, convert = convert)
+  # predicted_adt <- predict_alternative(predictor,gexp_test)
   if(class(adt_test)[1] == "Assay" |class(adt_test)[1] == "Assay5"){ adt_test <- Seurat::GetAssayData(adt_test, layer = adt_layer) }
   if(normalize_adt){
     #adding a pseudocount of 0.99 so CLR transform of 0 values doesn't throw an error --> ok if counts overall are not super low
@@ -589,4 +688,173 @@ gexp_normalize <- function(gexp_matrix, center.size.factors = FALSE, log = FALSE
   gexp_matrix <- sce@assays@data@listData[["normcounts"]]
   gexp_matrix <- base::log1p(gexp_matrix)
   return(gexp_matrix)
+}
+
+
+
+
+fit_predictor_alternative <- function(gexp_train,adt_train, gexp_test = NULL,
+                          layer_gex = "counts", layer_adt = "counts",
+                          normalize_gex = TRUE,normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2,
+                          n_components = 300, zscore_relative_to_tsvd = 'after',n_cores = NULL, reused_tsvd = NULL){
+  # If no number is specified, get number of available cores and omit 4 to avoid using up all system resources
+  if(is.null(n_cores)){n_cores <- parallelly::availableCores(omit = 4)}
+  # If objects are passed as matrices, leave as is. If passed as Seurat objects --> extract count data for assays
+  if(class(gexp_train)[1] == "Assay" | class(gexp_train)[1] == "Assay5"){ gexp_train <- Seurat::GetAssayData(gexp_train, layer = layer_gex) }
+  if(class(adt_train)[1] == "Assay" | class(adt_train)[1] == "Assay5"){ adt_train <- Seurat::GetAssayData(adt_train, layer = layer_adt) }
+  if(!is.null(gexp_test)){
+    if(class(gexp_test)[1] == "Assay" |class(gexp_test)[1] == "Assay5"){ gexp_test <- Seurat::GetAssayData(gexp_test, layer = layer_gex) }
+  }
+
+  #TODO: Change it so normalization happens for both train and test at the same time
+  # if(normalize_gex){
+  #   gexp_train <- gexp_normalize(gexp_train)
+  #   if( !is.null(gexp_test)){gexp_test <- gexp_normalize(gexp_test)}
+  # }
+  if(normalize_adt){
+    #adding a pseudocount of 0.99 so CLR transform of 0 values doesn't throw an error --> ok if counts overall are not super low
+    #Using 0.99 instead of 1 to make it more easily distinguishable from true 1s during debugging
+    #Better option would likely to ignore these ADT values entirely for training the LM
+    if(adt_norm_method == 'CLR'){
+      adt_train[adt_train == 0] <- 0.99
+      adt_train <- Matrix::Matrix((t(compositions::clr(t(as.matrix(adt_train))))),sparse = TRUE)
+    }else if(adt_norm_method == 'legacy'){
+      adt_train <- Seurat::NormalizeData(adt_train, normalization.method = "CLR", margin = margin)
+    }else{
+      Print('If normalize adt is set to TRUE (default), adt_norm_method has to be set to either CLR or legacy')
+    }
+  }
+
+  # The way the sets are generated, same gene names should be a given (stem from same dataset just split)
+  if(!is.null(gexp_test)){
+    training_set <- cbind(gexp_train,gexp_test)
+  }else{training_set <- gexp_train}
+
+  gex_trainset_seurat <- Seurat::CreateSeuratObject(counts = training_set, assay = 'RNA', min.cells = 1, min.features = 1)
+  gex_trainset_seurat <- NormalizeData(gex_trainset_seurat)
+  gex_trainset_seurat <- FindVariableFeatures(gex_trainset_seurat)
+  gex_trainset_seurat <- ScaleData(gex_trainset_seurat)
+  gex_trainset_seurat <- RunPCA(gex_trainset_seurat, features = VariableFeatures(object = gex_trainset_seurat),
+                                return.model = TRUE, npcs = n_components)
+
+  # z-score normalization --> transpose after applying z-score is necessary to get THE SAME dimension as the input
+  # if(zscore_relative_to_tsvd == 'before'){
+  #   training_set <- Matrix::t(apply(training_set, 1, function(x) {
+  #     (x - mean(x)) / sd(x)
+  #   }
+  #   ))
+  # }
+
+  # When doing train test split to evaluate model performance and then retraining the model on full data
+  # --> If gex_test was used in the original tsvd, there is no reason to recalculate it
+  # Since tSVD calculation is one of the most time, consuming steps, include option to pass previously calculated svd projector
+  # if(!is.null(reused_tsvd)){
+  #   print('Reusing tSVD projector matrix')
+  #   projector <- reused_tsvd
+  # }else{
+  #   # Create tSVD decomposition
+  #   print('Calculating truncated singular value decomposition - for large input matrices this may take several minutes')
+  #   trained_tsvd <- sparsesvd::sparsesvd(training_set,rank = n_components)
+  #   print('tSVD done')
+  #   projector <- trained_tsvd$v
+  # }
+  # apply tSVD projection on input data
+  training_set <- gex_trainset_seurat@reductions$pca@cell.embeddings
+  # z-score normalizaton
+
+  # if(zscore_relative_to_tsvd == 'after'){
+  #   training_set <- Matrix::t(apply(training_set, 1, function(x) {
+  #     (x - mean(x)) / sd(x)
+  #   }
+  #   ))
+  # }
+
+  # If not zscore normalized, training set is not a matrix at this point --> take transformation out of the zscore block
+  # For not explicit conversion here
+  # training_set <- as.matrix(training_set)
+
+
+  # If lm-test-data was used for tsvd training step, reduce lm input back to only train data
+  training_set <- training_set[intersect(colnames(gexp_train),rownames(training_set)),]
+
+  # Filter out adt data for cells dropped due to RNA 0-counts
+  # transposed to match expected input format for lm
+  # here the indexing works rather quickly --> no conversion to array necessary
+  adt_train_modelling <- Matrix::t(adt_train)[intersect(Cells(gex_trainset_seurat), colnames(adt_train)),]
+
+
+
+  rm(gexp_train,gexp_test,adt_train)
+  print('Fitting linear models')
+
+  # cl <- parallel::makeCluster(n_cores,outfile = 'predictor_fit_alt_log.txt')
+  # parallel::clusterExport(cl,list("training_set","adt_train_modelling"),envir = environment())
+  # parallel::clusterEvalQ(cl,library(Matrix))
+  # results <- pbapply::pblapply(cl = cl, X = 1:ncol(adt_train_modelling), FUN = function(i) {
+  #   tryCatch({
+  #     return(lm(adt_train_modelling[, i] ~ training_set)$coefficients)  # Fit a linear model
+  #   }, error = function(e) {
+  #     message("Error fitting model for response ", i, ": ", e$message)
+  #     return(NULL)  # Return NULL if there's an error
+  #   })
+  # })
+  # parallel::stopCluster(cl)
+  results <- cluster_call_model_training(adt_train_modelling,training_set,n_cores)
+  names(results) <- colnames(adt_train_modelling)
+  return(list(traindat = gex_trainset_seurat, lm_coefficients = results,
+              zscore_relative_to_tsvd = zscore_relative_to_tsvd))
+}
+
+predict_alternative <- function(train_model,gexp,layer="counts"){
+  # TODO: Make it properly part of package requirements
+  library(dplyr)
+  if(any(class(gexp) %in% c("Seurat", "Assay", "Assay5"))){
+    gexp <- Seurat::GetAssayData(gexp, layer = layer)
+  }else{ # assume it is a matrix type
+    gexp <- Matrix::Matrix(gexp, sparse = TRUE)
+  }
+
+  gex <- match_genesets(Seurat::GetAssayData(train_model$traindat, layer = 'counts'),gexp)
+  gex <- Seurat::CreateSeuratObject(counts = gex, assay = 'RNA')
+  gex <- NormalizeData(gex)
+  gex <- FindVariableFeatures(gex)
+  gex <- ScaleData(gex)
+  IAnchors <- Seurat::FindTransferAnchors(reference = train_model$traindat,query = gex,
+                                          reduction = 'pcaproject', reference.reduction = 'pca',
+                                          dims = 1:ncol(train_model$traindat@reductions$pca@cell.embeddings))
+  gex <- Seurat::IntegrateEmbeddings(IAnchors, reference =  train_model$traindat, query =  gex)
+  coeff_matrix <- matrix(nrow = ncol(gex@reductions$integrated_dr)+1)
+  # Last coefficient usually 0 --> reason not quite clear. Does z-score normalization introduce linear dependence since mean must be 0
+  for(model in train_model$lm_coefficients){
+    coeff_matrix <- cbind(coeff_matrix,model)
+  }
+  coeff_matrix[is.na(coeff_matrix)] <- 0
+  # Drop the empty column from the coeff matrix (used only to initialize the object)
+  coeff_matrix <- coeff_matrix[,2:ncol(coeff_matrix)]
+  # Add column of 1s 'to the left' of the tSVD projection of the test data --> adds intercept of each model (intercept is the first coefficient of the lm)
+  lm_input <- cbind(rep(1,nrow(gex@reductions$integrated_dr@cell.embeddings)),gex@reductions$integrated_dr@cell.embeddings)
+  # Multiply tSVD projected & normed input data with LM coefficients
+  res <- lm_input %*% coeff_matrix
+  colnames(res) <- names(train_model$lm_coefficients)
+  return(res)
+}
+
+
+
+
+#Separate function in the hopes that this will lead to only the variable in THIS cluster's environment being passed to each node
+cluster_call_model_training <- function(adt_train_modelling,training_set,n_cores){
+  cl <- parallel::makeCluster(n_cores,outfile = 'predictor_fit_alt_log.txt')
+  parallel::clusterExport(cl,list("training_set","adt_train_modelling"),envir = environment())
+  parallel::clusterEvalQ(cl,library(Matrix))
+  results <- pbapply::pblapply(cl = cl, X = 1:ncol(adt_train_modelling), FUN = function(i) {
+    tryCatch({
+      return(lm(adt_train_modelling[, i] ~ training_set)$coefficients)  # Fit a linear model
+    }, error = function(e) {
+      message("Error fitting model for response ", i, ": ", e$message)
+      return(NULL)  # Return NULL if there's an error
+    })
+  })
+  parallel::stopCluster(cl)
+  return(results)
 }

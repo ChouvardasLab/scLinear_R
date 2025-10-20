@@ -12,10 +12,12 @@ fit_predictor(
   layer_adt = "counts",
   normalize_gex = TRUE,
   normalize_adt = TRUE,
+  adt_norm_method = "CLR",
   margin = 2,
   n_components = 300,
   zscore_relative_to_tsvd = "after",
-  n_cores = NULL
+  n_cores = NULL,
+  reused_tsvd = NULL
 )
 }
 \arguments{

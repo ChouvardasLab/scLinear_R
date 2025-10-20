@@ -4,7 +4,13 @@
 \alias{predict}
 \title{Predicts ADT levels based on the gene expression levels.}
 \usage{
-predict(predictor, gexp, layer = "counts", normalize_gex = TRUE)
+predict(
+  predictor,
+  gexp,
+  layer = "counts",
+  normalize_gex = TRUE,
+  convert = "None"
+)
 }
 \arguments{
 \item{predictor}{predictor trained with 'fit_predictor' function}
