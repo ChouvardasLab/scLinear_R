@@ -106,15 +106,43 @@ filter_input_genes <- function(gexp,predictor){
   return(rbind(gexp,artificial_gene_counts)[predictor$genes_considered,])
 }
 
+# Auxiliary function
+# Get ensg to hgnc mapping
+get_gene_map <- function() {
+  #Where to store the mapping
+  dir <- tools::R_user_dir("scLineaR", "cache")
+  if (!dir.exists(dir)) dir.create(dir, recursive = TRUE)
+  path <- file.path(dir, "ensg_hgnc.rds")
+  #Read cached mapping table if it exists
+  if (file.exists(path)) {
+    return(readRDS(path))
+  }
+  # Otherwise - try to download
+  res <- try({
+    library(biomaRt)
+    mart <- useMart("ensembl", dataset = "hsapiens_gene_ensembl")
+    df <- getBM(
+      attributes = c("ensembl_gene_id", "hgnc_symbol"),
+      mart = mart
+    )
+    saveRDS(df, path)
+    df
+  }, silent = TRUE)
+
+  if (inherits(res, "try-error")) {
+    stop("No cached gene map available and biomaRt failed.")
+  }
+ return(res)
+}
+
+
+
+
 # Similar to filter input genes but with mapping between ENSG IDs and HGNC gene symbols built in
 match_genesets <- function(reference_names,newdat){
   # How to import !! for sym without loading the whole library?
   library(dplyr)
-  # ensembl =  biomaRt::useMart("ensembl",dataset="hsapiens_gene_ensembl")
-  # gene_identifiers <- biomaRt::getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),mart = ensembl)
-  # Table generated using the above two lines --> saving for future use since
-  # trying to access ensembl data from server sometimes results in timeout error depending on connection
-  gene_identifiers <- read.table('hgnc_ensg_identifier_mapping.txt')
+  gene_identifiers <- get_gene_map()
 
   # Drop empty mappings
   gene_identifiers <- gene_identifiers[gene_identifiers$ensembl_gene_id != '' & gene_identifiers$hgnc_symbol != '',]
@@ -615,8 +643,8 @@ feature_importance <- function(predictor,gexp,layer_gexp,normalize_gex = TRUE,n_
   environment(f) <- env
   cl <- parallel::makeCluster(n_cores)
   # Likely change to 'library(scLineaR)' when deploying as a package if path is not relative to package directory
-  # parallel::clusterEvalQ(cl,library(scLineaR))
-  parallel::clusterEvalQ(cl,Rcpp::sourceCpp('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/src/matrix_product.cpp'))
+  parallel::clusterEvalQ(cl,library(scLineaR))
+  # parallel::clusterEvalQ(cl,Rcpp::sourceCpp('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/src/matrix_product.cpp'))
   parallel::clusterExport(cl,list('v'),envir = env)
   parallel::clusterExport(cl,list('cross_cell_average_fi_c'))
   WJV <- pbapply::pbapply(cl=cl, X= WJ, MARGIN = 1, FUN= f)
