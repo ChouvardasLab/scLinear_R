@@ -87,8 +87,6 @@ prepare_data <- function(object, remove_doublets = TRUE, low_qc_cell_removal = T
   }else{
     return_object <- object
   }
-
-
   return(return_object)
 
 }
@@ -109,25 +107,29 @@ filter_input_genes <- function(gexp,predictor){
 }
 
 # Similar to filter input genes but with mapping between ENSG IDs and HGNC gene symbols built in
-match_genesets <- function(reference,newdat){
+match_genesets <- function(reference_names,newdat){
   # How to import !! for sym without loading the whole library?
   library(dplyr)
-  ensembl =  biomaRt::useMart("ensembl",dataset="hsapiens_gene_ensembl")
-  gene_identifiers <- biomaRt::getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),mart = ensembl)
+  # ensembl =  biomaRt::useMart("ensembl",dataset="hsapiens_gene_ensembl")
+  # gene_identifiers <- biomaRt::getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),mart = ensembl)
+  # Table generated using the above two lines --> saving for future use since
+  # trying to access ensembl data from server sometimes results in timeout error depending on connection
+  gene_identifiers <- read.table('hgnc_ensg_identifier_mapping.txt')
+
   # Drop empty mappings
   gene_identifiers <- gene_identifiers[gene_identifiers$ensembl_gene_id != '' & gene_identifiers$hgnc_symbol != '',]
   # Determine which id type was used for both datasets
-  matches_gex_ensembl <- length(intersect(rownames(reference),gene_identifiers$ensembl_gene_id))
-  matches_gex_hgnc <- length(intersect(rownames(reference),gene_identifiers$hgnc_symbol))
+  matches_gex_ensembl <- length(intersect(reference_names,gene_identifiers$ensembl_gene_id))
+  matches_gex_hgnc <- length(intersect(reference_names,gene_identifiers$hgnc_symbol))
   matches_predictor_input_ensembl <- length(intersect(rownames(newdat),gene_identifiers$ensembl_gene_id))
   matches_predictor_input_hgnc <- length(intersect(rownames(newdat),gene_identifiers$hgnc_symbol))
 
   id_type_gex <- 'Undetermined'
   id_type_prediction_input <- 'Undetermined'
 
-  if(matches_gex_ensembl > matches_gex_hgnc & matches_gex_ensembl > 0.3 * length(unique(rownames(reference)))){
+  if(matches_gex_ensembl > matches_gex_hgnc & matches_gex_ensembl > 0.3 * length(unique(reference_names))){
     id_type_gex <- 'ensembl_gene_id'
-  }else if(matches_gex_ensembl < matches_gex_hgnc & matches_gex_hgnc > 0.3 * length(unique(rownames(reference)))){
+  }else if(matches_gex_ensembl < matches_gex_hgnc & matches_gex_hgnc > 0.3 * length(unique(reference_names))){
     id_type_gex <- 'hgnc_symbol'
   }
   if(matches_predictor_input_ensembl > matches_predictor_input_hgnc & matches_predictor_input_ensembl > 0.3 * length(unique(rownames(newdat)))){
@@ -143,7 +145,7 @@ match_genesets <- function(reference,newdat){
   if(id_type_gex != id_type_prediction_input){
     sym_id_type_gex <- sym(id_type_gex)
     sym_id_type_prediction_input <- sym(id_type_prediction_input)
-    mapping_options <- gene_identifiers %>% filter(!!sym_id_type_gex %in% rownames(reference) &
+    mapping_options <- gene_identifiers %>% filter(!!sym_id_type_gex %in% reference_names &
                                                    !!sym_id_type_prediction_input %in% rownames(newdat)
     )
     ambiguous <- which(table(mapping_options$hgnc_symbol) > 1)
@@ -171,12 +173,13 @@ match_genesets <- function(reference,newdat){
     newdat <- newdat[!is.na(rownames(newdat)),]
 
   }
-  to_add <- setdiff(rownames(reference),rownames(newdat))
+  to_add <- setdiff(reference_names,rownames(newdat))
+  cat(paste0('Missing counts for ',length(to_add),' genes which were used for training of the ADT prediction model'))
   # Buffer missing gene counts with 0
   artificial_gene_counts <- Matrix::Matrix(0,nrow = length(to_add),ncol = ncol(newdat),
                                            dimnames = list(to_add,colnames(newdat)))
   # Add together original data and buffer 0 and arrange the rows in the same order as the genes were ordered in the training data
-  newdat <- rbind(newdat,artificial_gene_counts)[rownames(reference),]
+  newdat <- rbind(newdat,artificial_gene_counts)[reference_names,]
   return(newdat)
 }
 
@@ -246,7 +249,7 @@ scLinear <- function(object, remove_doublets = TRUE, low_qc_cell_removal = TRUE,
 fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
                             layer_gex = "counts", layer_adt = "counts",
                             normalize_gex = TRUE,normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2,
-                            n_components = 300, zscore_relative_to_tsvd = 'after',n_cores = NULL, reused_tsvd = NULL){
+                            n_components = 300, zscore_relative_to_tsvd = 'after',n_cores = NULL, reused_tsvd = NULL, isos = NULL){
   # If no number is specified, get number of available cores and omit 4 to avoid using up all system resources
   if(is.null(n_cores)){n_cores <- parallelly::availableCores(omit = 4)}
   # If objects are passed as matrices, leave as is. If passed as Seurat objects --> extract count data for assays
@@ -275,11 +278,16 @@ fit_predictor <- function(gexp_train,adt_train, gexp_test = NULL,
     # replace <- matrix(rep(replace,nrow(adt_train)),nrow = nrow(adt_train),byrow = TRUE)
     adt_train <- Matrix::Matrix((t(compositions::clr(t(as.matrix(adt_train))))),sparse = TRUE)
     # adt_train <- Matrix::Matrix((t(compositions::ilr(t(as.matrix(adt_train))))),sparse = TRUE)
-
     # adt_train[adt_train == 0 & drop_mask] <- replace[adt_train == 0 & drop_mask]
     }else if(adt_norm_method == 'legacy'){
     adt_train <- Seurat::NormalizeData(adt_train, normalization.method = "CLR", margin = margin)
-    }else{
+    }else if(adt_norm_method == 'dsb_no_empty'){
+      adt_train <- dsb::ModelNegativeADTnorm(adt_train,isotype.control.name.vec = isos)
+    }else if(adt_norm_method == 'log'){
+      adt_train[adt_train == 0] <- 0.99
+      adt_train <- log(adt_train)
+    }
+    else{
       Print('If normalize adt is set to TRUE (default), adt_norm_method has to be set to either CLR or legacy')
     }
   }
@@ -379,55 +387,8 @@ predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE,convert = '
 
   #Normalization first based on all genes then filter might be more accurate but takes much longer
 
-  #Determine whether ENSG IDs or 'Gene names' were used in count matrices of
-  #a) Counts used for model training
-  #b) Counts to which model is now being applied to
-  ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
-  gene_identifiers <- getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),mart = ensembl)
-
-  gene_identifiers_new <- rownames(gexp)
-  gene_identifiers_predictor <- predictor$genes_considered
-
-  matches_gex_ensembl <- length(intersect(gene_identifiers_new,gene_identifiers$ensembl_gene_id))
-  matches_gex_hgnc <- length(intersect(gene_identifiers_new,gene_identifiers$hgnc_symbol))
-  matches_predictor_input_ensembl <- length(intersect(rownames(gex),gene_identifiers$ensembl_gene_id))
-  matches_predictor_input_hgnc <- length(intersect(rownames(gex),gene_identifiers$hgnc_symbol))
-
-  id_type_gex <- 'Undetermined'
-  id_type_predictor_input <- 'Undetermined'
-
-  if(matches_gex_ensembl > matches_gex_hgnc & matches_gex_ensembl > 0.3 * length(unique(rownames(gex)))){
-    id_type_gex <- 'ensembl_gene_id'
-  }else if(matches_gex_ensembl < matches_gex_hgnc & matches_gex_hgnc > 0.3 * length(unique(rownames(gex)))){
-    id_type_gex <- 'hgnc_symbol'
-  }
-  if(matches_predictor_input_ensembl > matches_predictor_input_hgnc & matches_predictor_input_ensembl > 0.3 * length(unique(rownames(gex)))){
-    id_type_predictor_input <- 'ensembl_gene_id'
-  }else if(matches_predictor_input_ensembl < matches_predictor_input_hgnc & matches_predictor_input_hgnc > 0.3 * length(unique(rownames(gex)))){
-    id_type_predictor_input <- 'hgnc_symbol'
-  }
-
-  # if(convert == 'ENSG_to_HGNC'){
-  #   gene_ids <- rownames(gexp)
-  #   ensembl = useMart("ensembl",dataset="hsapiens_gene_ensembl")
-  #   gnames <- getBM(attributes=c('ensembl_gene_id','hgnc_symbol'),
-  #                   filters = 'ensembl_gene_id',
-  #                   values = gene_ids,
-  #                   mart = ensembl)
-  #   gnames <- gnames[gnames$hgnc_symbol != '',]
-  #   keep_genes <-gene_ids[gene_ids %in% gnames$ensembl_gene_id]
-  #   gexp <- Matrix::t(Matrix::t(gexp)[,keep_genes])
-  #   ambiguous_symbol_mappings <- names(which(table(gnames$ensembl_gene_id) > 1))
-  #   mapping_options <- gnames[gnames$ensembl_gene_id %in% ambiguous_symbol_mappings,'hgnc_symbol']
-  #   # intersect(mapping_options,predictor$genes_considered)
-  #   gnames <- gnames %>% group_by(ensembl_gene_id) %>% summarise(hgnc_symbol = head(hgnc_symbol,1))
-  #   rownames(gnames) <- gnames$ensembl_gene_id
-  #   rownames(gexp) <- gnames[rownames(gexp),]$hgnc_symbol
-  # }
-  gexp <- filter_input_genes(gexp,predictor)
-
-  missing <- setdiff(predictor$genes_considered,rownames(gexp))
-  cat(paste0('Missing counts for ',length(missing),' genes which were used for training of the ADT prediction model'))
+  # gexp <- filter_input_genes(gexp,predictor)
+  gexp <- match_genesets(predictor$genes_considered,gexp)
 
   if(normalize_gex){
     gexp <- gexp_normalize(gexp)
@@ -484,7 +445,7 @@ predict <- function(predictor,gexp,layer="counts",normalize_gex=TRUE,convert = '
 #' @return List of metrics for model performance (Mean RMSE of all models and ADT-specific correlation coefficients between predicted and measured ADT Values)
 #' @export
 evaluate_predictor <- function(predictor,gexp_test,adt_test,gexp_layer = 'counts', adt_layer = 'counts', normalize_gex = TRUE,
-                               normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2, convert = 'None'){
+                               normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2, convert = 'None', isos = NULL){
   # ToFix --> can't compare CLR if different subsets were considered since it's compositional data
   predicted_adt <- predict(predictor,gexp_test,layer = gexp_layer, normalize_gex = normalize_gex, convert = convert)
   # predicted_adt <- predict_alternative(predictor,gexp_test)
@@ -498,15 +459,24 @@ evaluate_predictor <- function(predictor,gexp_test,adt_test,gexp_layer = 'counts
       adt_test <- Matrix::Matrix(((compositions::clr(t(as.matrix(adt_test))))),sparse = TRUE)
     }else if(adt_norm_method == 'legacy'){
       adt_test <- Matrix::t(Seurat::NormalizeData(adt_test, normalization.method = "CLR", margin = margin))
-    }else{
+    }else if(adt_norm_method == 'dsb_no_empty'){
+      adt_test <- Matrix::t(dsb::ModelNegativeADTnorm(adt_test,isotype.control.name.vec = isos))
+    }else if(adt_norm_method == 'log'){
+      adt_test[adt_test == 0] <- 0.99
+      adt_test <- Matrix::t(log(adt_test))
+    }
+    else{
       Print('If normalize adt is set to TRUE (default), adt_norm_method has to be set to either CLR or legacy')
     }
   }else{
       # Converting from Matrix::Matrix to base Matrix (and transposing)
       adt_test <- as.matrix(Matrix::t(adt_test))
   }
-  p_adt <- subset(predicted_adt,subset = colnames(predicted_adt) %in% colnames(adt_test))
-  t_adt <- (subset(as.matrix(adt_test),subset = colnames(adt_test) %in% colnames(predicted_adt)))
+  #What's the subsetting for? Protein filter or cell filter?
+  # p_adt <- subset(predicted_adt,subset = rownames(predicted_adt) %in% rownames(adt_test))
+  # t_adt <- (subset(as.matrix(adt_test),subset = rownames(adt_test) %in% rownames(predicted_adt)))
+  p_adt <- predicted_adt
+  t_adt <- as.matrix(adt_test)
   t_adt <- t_adt[match(rownames(p_adt),rownames(t_adt)),match(colnames(p_adt),colnames(t_adt))]
   err_sq <- (p_adt-t_adt)^2
   # Not sure how to interpret the means of the single model metrics but for now just replicating the behaviour of python code
@@ -619,38 +589,39 @@ feature_importance <- function(predictor,gexp,layer_gexp,normalize_gex = TRUE,n_
   # Slow but that's a looooot of matrix multiplications to run so probably to be expected
 
   N <- ncol(gexp_projected)
-  cl <- parallel::makeCluster(n_cores,outfile = 'feature_importance_log.txt')
-  parallel::clusterExport(cl,list('cellwise_jacobian'))
-  print('Calculating Jacobian of z-score normalization step')
-
-  Js <- pbapply::pbapply(cl=cl,X = gexp_projected, MARGIN = 1,FUN = cellwise_jacobian,simplify = FALSE)
-  parallel::stopCluster(cl)
+  # cl <- parallel::makeCluster(n_cores,outfile = 'feature_importance_log.txt')
+  # parallel::clusterExport(cl,list('cellwise_jacobian'))
+  # print('Calculating Jacobian of z-score normalization step')
+  #
+  # Js <- pbapply::pbapply(cl=cl,X = gexp_projected, MARGIN = 1,FUN = cellwise_jacobian,simplify = FALSE)
+  # parallel::stopCluster(cl)
+  Js <- cluster_call_cellwise_jacobian(gexp_projected,n_cores)
 
   #transposing so we can use crossprod for apply function --> circumvents having to do FUN = function(X)
   # ... which slows down parallelization when called from environment other than global
-  cl <- parallel::makeCluster(n_cores,outfile = 'feature_importance_log.txt')
-  parallel::clusterExport(cl,list('coeff_matrix'),envir = environment())
-  parallel::clusterExport(cl,list('matprod_rl'))
-  print('Calculating Matrix product WJ')
-  WJ <- abind::abind(pbapply::pblapply(cl = cl, X= Js,FUN = matprod_rl,m1 = coeff_matrix ),along = 3)
-  parallel::stopCluster(cl)
-
-  # v_t <- Matrix::t(predictor$tsvd_v)
-  v <- Matrix::t(predictor$tsvd_v)
+  # cl <- parallel::makeCluster(n_cores,outfile = 'feature_importance_log.txt')
+  # parallel::clusterExport(cl,list('coeff_matrix'),envir = environment())
+  # parallel::clusterExport(cl,list('matprod_rl'))
+  # print('Calculating Matrix product WJ')
+  # WJ <- abind::abind(pbapply::pblapply(cl = cl, X= Js,FUN = matprod_rl,m1 = coeff_matrix ),along = 3)
+  # parallel::stopCluster(cl)
+  WJ <- cluster_call_WJ(Js,coeff_matrix, n_cores)
 
   print('Calculating Matrix product WJV')
+  v <- Matrix::t(predictor$tsvd_v)
   f <- function(WJ_element){cross_cell_average_fi_c(WJ_element,v)}
   env <- new.env(parent = environment(feature_importance))
   env$v <- v
   environment(f) <- env
-  cl <- parallel::makeCluster(n_cores,outfile = 'feature_importance_log.txt')
+  cl <- parallel::makeCluster(n_cores)
   # Likely change to 'library(scLineaR)' when deploying as a package if path is not relative to package directory
-  parallel::clusterEvalQ(cl,Rcpp::sourceCpp('src/matrix_product.cpp'))
+  # parallel::clusterEvalQ(cl,library(scLineaR))
+  parallel::clusterEvalQ(cl,Rcpp::sourceCpp('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/src/matrix_product.cpp'))
   parallel::clusterExport(cl,list('v'),envir = env)
   parallel::clusterExport(cl,list('cross_cell_average_fi_c'))
   WJV <- pbapply::pbapply(cl=cl, X= WJ, MARGIN = 1, FUN= f)
   parallel::stopCluster(cl)
-  file.remove('feature_importance_log.txt')
+  # WJV <- cluster_call_WJV(WJ,v,n_cores)
   # Axis 1 = model, Axis 2 = Gene, Axis 3 = Cell --> taking mean 'across cells' = mean over margin of axis 1&2
   rownames(WJV) <- gexp_names
   colnames(WJV) <- names(predictor$lm_coefficients)
@@ -693,154 +664,151 @@ gexp_normalize <- function(gexp_matrix, center.size.factors = FALSE, log = FALSE
 
 
 
-fit_predictor_alternative <- function(gexp_train,adt_train, gexp_test = NULL,
-                          layer_gex = "counts", layer_adt = "counts",
-                          normalize_gex = TRUE,normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2,
-                          n_components = 300, zscore_relative_to_tsvd = 'after',n_cores = NULL, reused_tsvd = NULL){
-  # If no number is specified, get number of available cores and omit 4 to avoid using up all system resources
-  if(is.null(n_cores)){n_cores <- parallelly::availableCores(omit = 4)}
-  # If objects are passed as matrices, leave as is. If passed as Seurat objects --> extract count data for assays
-  if(class(gexp_train)[1] == "Assay" | class(gexp_train)[1] == "Assay5"){ gexp_train <- Seurat::GetAssayData(gexp_train, layer = layer_gex) }
-  if(class(adt_train)[1] == "Assay" | class(adt_train)[1] == "Assay5"){ adt_train <- Seurat::GetAssayData(adt_train, layer = layer_adt) }
-  if(!is.null(gexp_test)){
-    if(class(gexp_test)[1] == "Assay" |class(gexp_test)[1] == "Assay5"){ gexp_test <- Seurat::GetAssayData(gexp_test, layer = layer_gex) }
-  }
-
-  #TODO: Change it so normalization happens for both train and test at the same time
-  # if(normalize_gex){
-  #   gexp_train <- gexp_normalize(gexp_train)
-  #   if( !is.null(gexp_test)){gexp_test <- gexp_normalize(gexp_test)}
-  # }
-  if(normalize_adt){
-    #adding a pseudocount of 0.99 so CLR transform of 0 values doesn't throw an error --> ok if counts overall are not super low
-    #Using 0.99 instead of 1 to make it more easily distinguishable from true 1s during debugging
-    #Better option would likely to ignore these ADT values entirely for training the LM
-    if(adt_norm_method == 'CLR'){
-      adt_train[adt_train == 0] <- 0.99
-      adt_train <- Matrix::Matrix((t(compositions::clr(t(as.matrix(adt_train))))),sparse = TRUE)
-    }else if(adt_norm_method == 'legacy'){
-      adt_train <- Seurat::NormalizeData(adt_train, normalization.method = "CLR", margin = margin)
-    }else{
-      Print('If normalize adt is set to TRUE (default), adt_norm_method has to be set to either CLR or legacy')
-    }
-  }
-
-  # The way the sets are generated, same gene names should be a given (stem from same dataset just split)
-  if(!is.null(gexp_test)){
-    training_set <- cbind(gexp_train,gexp_test)
-  }else{training_set <- gexp_train}
-
-  gex_trainset_seurat <- Seurat::CreateSeuratObject(counts = training_set, assay = 'RNA', min.cells = 1, min.features = 1)
-  gex_trainset_seurat <- NormalizeData(gex_trainset_seurat)
-  gex_trainset_seurat <- FindVariableFeatures(gex_trainset_seurat)
-  gex_trainset_seurat <- ScaleData(gex_trainset_seurat)
-  gex_trainset_seurat <- RunPCA(gex_trainset_seurat, features = VariableFeatures(object = gex_trainset_seurat),
-                                return.model = TRUE, npcs = n_components)
-
-  # z-score normalization --> transpose after applying z-score is necessary to get THE SAME dimension as the input
-  # if(zscore_relative_to_tsvd == 'before'){
-  #   training_set <- Matrix::t(apply(training_set, 1, function(x) {
-  #     (x - mean(x)) / sd(x)
-  #   }
-  #   ))
-  # }
-
-  # When doing train test split to evaluate model performance and then retraining the model on full data
-  # --> If gex_test was used in the original tsvd, there is no reason to recalculate it
-  # Since tSVD calculation is one of the most time, consuming steps, include option to pass previously calculated svd projector
-  # if(!is.null(reused_tsvd)){
-  #   print('Reusing tSVD projector matrix')
-  #   projector <- reused_tsvd
-  # }else{
-  #   # Create tSVD decomposition
-  #   print('Calculating truncated singular value decomposition - for large input matrices this may take several minutes')
-  #   trained_tsvd <- sparsesvd::sparsesvd(training_set,rank = n_components)
-  #   print('tSVD done')
-  #   projector <- trained_tsvd$v
-  # }
-  # apply tSVD projection on input data
-  training_set <- gex_trainset_seurat@reductions$pca@cell.embeddings
-  # z-score normalizaton
-
-  # if(zscore_relative_to_tsvd == 'after'){
-  #   training_set <- Matrix::t(apply(training_set, 1, function(x) {
-  #     (x - mean(x)) / sd(x)
-  #   }
-  #   ))
-  # }
-
-  # If not zscore normalized, training set is not a matrix at this point --> take transformation out of the zscore block
-  # For not explicit conversion here
-  # training_set <- as.matrix(training_set)
-
-
-  # If lm-test-data was used for tsvd training step, reduce lm input back to only train data
-  training_set <- training_set[intersect(colnames(gexp_train),rownames(training_set)),]
-
-  # Filter out adt data for cells dropped due to RNA 0-counts
-  # transposed to match expected input format for lm
-  # here the indexing works rather quickly --> no conversion to array necessary
-  adt_train_modelling <- Matrix::t(adt_train)[intersect(Cells(gex_trainset_seurat), colnames(adt_train)),]
-
-
-
-  rm(gexp_train,gexp_test,adt_train)
-  print('Fitting linear models')
-
-  # cl <- parallel::makeCluster(n_cores,outfile = 'predictor_fit_alt_log.txt')
-  # parallel::clusterExport(cl,list("training_set","adt_train_modelling"),envir = environment())
-  # parallel::clusterEvalQ(cl,library(Matrix))
-  # results <- pbapply::pblapply(cl = cl, X = 1:ncol(adt_train_modelling), FUN = function(i) {
-  #   tryCatch({
-  #     return(lm(adt_train_modelling[, i] ~ training_set)$coefficients)  # Fit a linear model
-  #   }, error = function(e) {
-  #     message("Error fitting model for response ", i, ": ", e$message)
-  #     return(NULL)  # Return NULL if there's an error
-  #   })
-  # })
-  # parallel::stopCluster(cl)
-  results <- cluster_call_model_training(adt_train_modelling,training_set,n_cores)
-  names(results) <- colnames(adt_train_modelling)
-  return(list(traindat = gex_trainset_seurat, lm_coefficients = results,
-              zscore_relative_to_tsvd = zscore_relative_to_tsvd))
-}
-
-predict_alternative <- function(train_model,gexp,layer="counts"){
-  # TODO: Make it properly part of package requirements
-  library(dplyr)
-  if(any(class(gexp) %in% c("Seurat", "Assay", "Assay5"))){
-    gexp <- Seurat::GetAssayData(gexp, layer = layer)
-  }else{ # assume it is a matrix type
-    gexp <- Matrix::Matrix(gexp, sparse = TRUE)
-  }
-
-  gex <- match_genesets(Seurat::GetAssayData(train_model$traindat, layer = 'counts'),gexp)
-  gex <- Seurat::CreateSeuratObject(counts = gex, assay = 'RNA')
-  gex <- NormalizeData(gex)
-  gex <- FindVariableFeatures(gex)
-  gex <- ScaleData(gex)
-  IAnchors <- Seurat::FindTransferAnchors(reference = train_model$traindat,query = gex,
-                                          reduction = 'pcaproject', reference.reduction = 'pca',
-                                          dims = 1:ncol(train_model$traindat@reductions$pca@cell.embeddings))
-  gex <- Seurat::IntegrateEmbeddings(IAnchors, reference =  train_model$traindat, query =  gex)
-  coeff_matrix <- matrix(nrow = ncol(gex@reductions$integrated_dr)+1)
-  # Last coefficient usually 0 --> reason not quite clear. Does z-score normalization introduce linear dependence since mean must be 0
-  for(model in train_model$lm_coefficients){
-    coeff_matrix <- cbind(coeff_matrix,model)
-  }
-  coeff_matrix[is.na(coeff_matrix)] <- 0
-  # Drop the empty column from the coeff matrix (used only to initialize the object)
-  coeff_matrix <- coeff_matrix[,2:ncol(coeff_matrix)]
-  # Add column of 1s 'to the left' of the tSVD projection of the test data --> adds intercept of each model (intercept is the first coefficient of the lm)
-  lm_input <- cbind(rep(1,nrow(gex@reductions$integrated_dr@cell.embeddings)),gex@reductions$integrated_dr@cell.embeddings)
-  # Multiply tSVD projected & normed input data with LM coefficients
-  res <- lm_input %*% coeff_matrix
-  colnames(res) <- names(train_model$lm_coefficients)
-  return(res)
-}
-
-
-
+# fit_predictor_alternative <- function(gexp_train,adt_train, gexp_test = NULL,
+#                           layer_gex = "counts", layer_adt = "counts",
+#                           normalize_gex = TRUE,normalize_adt = TRUE, adt_norm_method = 'CLR', margin = 2,
+#                           n_components = 300, zscore_relative_to_tsvd = 'after',n_cores = NULL, reused_tsvd = NULL){
+#   # If no number is specified, get number of available cores and omit 4 to avoid using up all system resources
+#   if(is.null(n_cores)){n_cores <- parallelly::availableCores(omit = 4)}
+#   # If objects are passed as matrices, leave as is. If passed as Seurat objects --> extract count data for assays
+#   if(class(gexp_train)[1] == "Assay" | class(gexp_train)[1] == "Assay5"){ gexp_train <- Seurat::GetAssayData(gexp_train, layer = layer_gex) }
+#   if(class(adt_train)[1] == "Assay" | class(adt_train)[1] == "Assay5"){ adt_train <- Seurat::GetAssayData(adt_train, layer = layer_adt) }
+#   if(!is.null(gexp_test)){
+#     if(class(gexp_test)[1] == "Assay" |class(gexp_test)[1] == "Assay5"){ gexp_test <- Seurat::GetAssayData(gexp_test, layer = layer_gex) }
+#   }
+#
+#   #TODO: Change it so normalization happens for both train and test at the same time
+#   # if(normalize_gex){
+#   #   gexp_train <- gexp_normalize(gexp_train)
+#   #   if( !is.null(gexp_test)){gexp_test <- gexp_normalize(gexp_test)}
+#   # }
+#   if(normalize_adt){
+#     #adding a pseudocount of 0.99 so CLR transform of 0 values doesn't throw an error --> ok if counts overall are not super low
+#     #Using 0.99 instead of 1 to make it more easily distinguishable from true 1s during debugging
+#     #Better option would likely to ignore these ADT values entirely for training the LM
+#     if(adt_norm_method == 'CLR'){
+#       adt_train[adt_train == 0] <- 0.99
+#       adt_train <- Matrix::Matrix((t(compositions::clr(t(as.matrix(adt_train))))),sparse = TRUE)
+#     }else if(adt_norm_method == 'legacy'){
+#       adt_train <- Seurat::NormalizeData(adt_train, normalization.method = "CLR", margin = margin)
+#     }else{
+#       Print('If normalize adt is set to TRUE (default), adt_norm_method has to be set to either CLR or legacy')
+#     }
+#   }
+#
+#   # The way the sets are generated, same gene names should be a given (stem from same dataset just split)
+#   if(!is.null(gexp_test)){
+#     training_set <- cbind(gexp_train,gexp_test)
+#   }else{training_set <- gexp_train}
+#
+#   gex_trainset_seurat <- Seurat::CreateSeuratObject(counts = training_set, assay = 'RNA', min.cells = 1, min.features = 1)
+#   gex_trainset_seurat <- NormalizeData(gex_trainset_seurat)
+#   gex_trainset_seurat <- FindVariableFeatures(gex_trainset_seurat)
+#   gex_trainset_seurat <- ScaleData(gex_trainset_seurat)
+#   gex_trainset_seurat <- RunPCA(gex_trainset_seurat, features = VariableFeatures(object = gex_trainset_seurat),
+#                                 return.model = TRUE, npcs = n_components)
+#
+#   # z-score normalization --> transpose after applying z-score is necessary to get THE SAME dimension as the input
+#   # if(zscore_relative_to_tsvd == 'before'){
+#   #   training_set <- Matrix::t(apply(training_set, 1, function(x) {
+#   #     (x - mean(x)) / sd(x)
+#   #   }
+#   #   ))
+#   # }
+#
+#   # When doing train test split to evaluate model performance and then retraining the model on full data
+#   # --> If gex_test was used in the original tsvd, there is no reason to recalculate it
+#   # Since tSVD calculation is one of the most time, consuming steps, include option to pass previously calculated svd projector
+#   # if(!is.null(reused_tsvd)){
+#   #   print('Reusing tSVD projector matrix')
+#   #   projector <- reused_tsvd
+#   # }else{
+#   #   # Create tSVD decomposition
+#   #   print('Calculating truncated singular value decomposition - for large input matrices this may take several minutes')
+#   #   trained_tsvd <- sparsesvd::sparsesvd(training_set,rank = n_components)
+#   #   print('tSVD done')
+#   #   projector <- trained_tsvd$v
+#   # }
+#   # apply tSVD projection on input data
+#   training_set <- gex_trainset_seurat@reductions$pca@cell.embeddings
+#   # z-score normalizaton
+#
+#   # if(zscore_relative_to_tsvd == 'after'){
+#   #   training_set <- Matrix::t(apply(training_set, 1, function(x) {
+#   #     (x - mean(x)) / sd(x)
+#   #   }
+#   #   ))
+#   # }
+#
+#   # If not zscore normalized, training set is not a matrix at this point --> take transformation out of the zscore block
+#   # For not explicit conversion here
+#   # training_set <- as.matrix(training_set)
+#
+#
+#   # If lm-test-data was used for tsvd training step, reduce lm input back to only train data
+#   training_set <- training_set[intersect(colnames(gexp_train),rownames(training_set)),]
+#
+#   # Filter out adt data for cells dropped due to RNA 0-counts
+#   # transposed to match expected input format for lm
+#   # here the indexing works rather quickly --> no conversion to array necessary
+#   adt_train_modelling <- Matrix::t(adt_train)[intersect(Cells(gex_trainset_seurat), colnames(adt_train)),]
+#
+#
+#
+#   rm(gexp_train,gexp_test,adt_train)
+#   print('Fitting linear models')
+#
+#   # cl <- parallel::makeCluster(n_cores,outfile = 'predictor_fit_alt_log.txt')
+#   # parallel::clusterExport(cl,list("training_set","adt_train_modelling"),envir = environment())
+#   # parallel::clusterEvalQ(cl,library(Matrix))
+#   # results <- pbapply::pblapply(cl = cl, X = 1:ncol(adt_train_modelling), FUN = function(i) {
+#   #   tryCatch({
+#   #     return(lm(adt_train_modelling[, i] ~ training_set)$coefficients)  # Fit a linear model
+#   #   }, error = function(e) {
+#   #     message("Error fitting model for response ", i, ": ", e$message)
+#   #     return(NULL)  # Return NULL if there's an error
+#   #   })
+#   # })
+#   # parallel::stopCluster(cl)
+#   results <- cluster_call_model_training(adt_train_modelling,training_set,n_cores)
+#   names(results) <- colnames(adt_train_modelling)
+#   return(list(traindat = gex_trainset_seurat, lm_coefficients = results,
+#               zscore_relative_to_tsvd = zscore_relative_to_tsvd))
+# }
+#
+# predict_alternative <- function(train_model,gexp,layer="counts"){
+#   # TODO: Make it properly part of package requirements
+#   library(dplyr)
+#   if(any(class(gexp) %in% c("Seurat", "Assay", "Assay5"))){
+#     gexp <- Seurat::GetAssayData(gexp, layer = layer)
+#   }else{ # assume it is a matrix type
+#     gexp <- Matrix::Matrix(gexp, sparse = TRUE)
+#   }
+#
+#   gex <- match_genesets(Seurat::GetAssayData(train_model$traindat, layer = 'counts'),gexp)
+#   gex <- Seurat::CreateSeuratObject(counts = gex, assay = 'RNA')
+#   gex <- NormalizeData(gex)
+#   gex <- FindVariableFeatures(gex)
+#   gex <- ScaleData(gex)
+#   IAnchors <- Seurat::FindTransferAnchors(reference = train_model$traindat,query = gex,
+#                                           reduction = 'pcaproject', reference.reduction = 'pca',
+#                                           dims = 1:ncol(train_model$traindat@reductions$pca@cell.embeddings))
+#   gex <- Seurat::IntegrateEmbeddings(IAnchors, reference =  train_model$traindat, query =  gex)
+#   coeff_matrix <- matrix(nrow = ncol(gex@reductions$integrated_dr)+1)
+#   # Last coefficient usually 0 --> reason not quite clear. Does z-score normalization introduce linear dependence since mean must be 0
+#   for(model in train_model$lm_coefficients){
+#     coeff_matrix <- cbind(coeff_matrix,model)
+#   }
+#   coeff_matrix[is.na(coeff_matrix)] <- 0
+#   # Drop the empty column from the coeff matrix (used only to initialize the object)
+#   coeff_matrix <- coeff_matrix[,2:ncol(coeff_matrix)]
+#   # Add column of 1s 'to the left' of the tSVD projection of the test data --> adds intercept of each model (intercept is the first coefficient of the lm)
+#   lm_input <- cbind(rep(1,nrow(gex@reductions$integrated_dr@cell.embeddings)),gex@reductions$integrated_dr@cell.embeddings)
+#   # Multiply tSVD projected & normed input data with LM coefficients
+#   res <- lm_input %*% coeff_matrix
+#   colnames(res) <- names(train_model$lm_coefficients)
+#   return(res)
+# }
 
 #Separate function in the hopes that this will lead to only the variable in THIS cluster's environment being passed to each node
 cluster_call_model_training <- function(adt_train_modelling,training_set,n_cores){
@@ -858,3 +826,39 @@ cluster_call_model_training <- function(adt_train_modelling,training_set,n_cores
   parallel::stopCluster(cl)
   return(results)
 }
+
+cluster_call_cellwise_jacobian <- function(gexp_projected,n_cores){
+  cl <- parallel::makeCluster(n_cores,outfile = 'feature_importance_log.txt')
+  parallel::clusterExport(cl,list('cellwise_jacobian'))
+  print('Calculating Jacobian of z-score normalization step')
+
+  Js <- pbapply::pbapply(cl=cl,X = gexp_projected, MARGIN = 1,FUN = cellwise_jacobian,simplify = FALSE)
+  parallel::stopCluster(cl)
+  return(Js)
+}
+
+cluster_call_WJ <- function(Js, coeff_matrix, n_cores){
+cl <- parallel::makeCluster(n_cores,outfile = 'feature_importance_log.txt')
+parallel::clusterExport(cl,list('coeff_matrix'),envir = environment())
+parallel::clusterExport(cl,list('matprod_rl'))
+print('Calculating Matrix product WJ')
+WJ <- abind::abind(pbapply::pblapply(cl = cl, X= Js,FUN = matprod_rl,m1 = coeff_matrix ),along = 3)
+parallel::stopCluster(cl)
+return(WJ)
+}
+
+# cluster_call_WJV <- function(WJ,v,n_cores){
+#   f <- function(WJ_element){cross_cell_average_fi_c(WJ_element,v)}
+#   env <- new.env(parent = environment(cluster_call_WJV))
+#   env$v <- v
+#   environment(f) <- env
+#   cl <- parallel::makeCluster(n_cores,outfile = 'feature_importance_log.txt')
+#   # Likely change to 'library(scLineaR)' when deploying as a package if path is not relative to package directory
+#   # parallel::clusterEvalQ(cl,library(scLineaR))
+#   parallel::clusterEvalQ(cl,Rcpp::sourceCpp('C:/Users/mz24b548/Documents/GitRepos_local/scLinear_R/src/matrix_product.cpp'))
+#   # parallel::clusterExport(cl,list('v'))
+#   parallel::clusterExport(cl,list('cross_cell_average_fi_c'))
+#   WJV <- pbapply::pbapply(cl=cl, X= WJ, MARGIN = 1, FUN= f)
+#   parallel::stopCluster(cl)
+#   return(WJV)
+# }
